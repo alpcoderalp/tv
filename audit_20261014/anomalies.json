@@ -1,0 +1,76 @@
+{
+  "audit_metadata": {
+    "deploy_start_utc": "2026-10-13T11:35:47Z",
+    "audit_cutoff_utc": "2026-10-14T12:05:06Z",
+    "git_commit": "99343fef7a364d0e1893b0cdff00cc2b64c0d558",
+    "git_dirty_status": "DIRTY (+3498 lines uncommitted in tv_signal_strategy.py)",
+    "head_commit_strategy_sha256": "94DF73B9A70792751C0805E0CFB4565409A23FC333A0D6030B40CCAFB488EE92",
+    "deployed_working_strategy_sha256": "3BA526095332836B5BB91CC308EE1A057DDBFB6BA9E4D24BEEA83D55960E12DB",
+    "container_image_digest": "sha256:12ea1f6c3d53d2fd214957c29b56bd0cecf2a52ba022e345a63dd36a54ba36fa"
+  },
+  "anomalies": [
+    {
+      "anomaly_id": "ANOMALY-01",
+      "category": "POSITION_CONSOLIDATION_COLLISION",
+      "title": "One-Way Mode Multi-Entry Blending Violates Logical Position Isolation",
+      "severity": "HIGH",
+      "affected_trades": [
+        "T-01",
+        "T-02",
+        "T-04",
+        "T-05",
+        "T-07",
+        "T-08",
+        "T-09",
+        "T-11",
+        "T-12",
+        "T-13",
+        "T-17",
+        "T-19",
+        "T-21"
+      ],
+      "description": "Bybit perpetual connector operates in One-Way Mode (positionIdx=0). When the strategy receives a second entry signal in the same symbol and side while a previous trade (or remainder) is open, Bybit aggregates them into a single exchange position with a weighted blended entry price. However, the bot's internal state tracks them as separate dictionary entries, creating an impedance mismatch between exchange risk and bot logic.",
+      "impact": "Stop orders from prior trades are either cancelled or rotated with partial quantities, leading to apparent quantity discrepancies (e.g., 6870 entry closed as 8450; 593 entry closed as 822). Hedge Mode does NOT solve this because Hedge Mode only isolates Buy from Sell, not multiple Buys or multiple Sells.",
+      "remediation": "Implement a strict Concurrency Mutex blocking new entries on the same symbol and side until previous position is fully flat, or route concurrent trades to separate Bybit subaccounts."
+    },
+    {
+      "anomaly_id": "ANOMALY-02",
+      "category": "AGGREGATE_FALLBACK_CANNIBALIZATION",
+      "title": "Stop Order of Secondary Entry Swallows Remainder of Prior Trade (Case #7)",
+      "severity": "HIGH",
+      "affected_trades": [
+        "T-05",
+        "T-12"
+      ],
+      "description": "In Trade #7 (T-12), parent 896351516234 entered short 6870 CHIP while parent 18400454197 had 1580 CHIP remaining open. After TP1 closed 3430 CHIP, the stop order H-S-896351516234-BB triggered with closeOnTrigger=True and executed for 5020 CHIP (closing the entire exchange position). This swallowed the 1580 CHIP of parent 18400454197, forcing the bot into an emergency [WS POS CLOSED] size=0 synthetic cleanup (SYNTH_FLAT_18400454197).",
+      "impact": "Position isolation is completely broken; prior trade's stop is invalidated and closed without execution of its own stop order.",
+      "remediation": "Do not allow multi-entry on the same side without subaccount isolation."
+    },
+    {
+      "anomaly_id": "ANOMALY-03",
+      "category": "LATENCY_WINDOW_PROTECTION",
+      "title": "Stop Loss Cancel-Replace Naked Interval",
+      "severity": "MEDIUM",
+      "affected_trades": [
+        "T-12",
+        "T-19",
+        "T-21"
+      ],
+      "description": "When rotating or resizing stop orders, the bot sends a cancel/deactivate request followed by a new stop order placement. During this network round-trip window (approx 150ms-400ms), the exchange position has no active stop loss registered.",
+      "impact": "If a violent market flash-crash occurs during this sub-second interval, liquidation or runaway loss could occur.",
+      "remediation": "Use Bybit /v5/order/amend endpoint or conditional order edit API rather than cancel-and-replace."
+    },
+    {
+      "anomaly_id": "ANOMALY-04",
+      "category": "EXECUTION_TYPE_CONTAMINATION",
+      "title": "Funding Settlements Present in Execution Stream",
+      "severity": "LOW",
+      "affected_trades": [
+        "ALL"
+      ],
+      "description": "Bybit /v5/execution/list returns records where execType=='Funding' alongside execType=='Trade'. If not explicitly filtered, trade reconcilers mistake periodic 8-hour funding cash deductions for zero-quantity order fills.",
+      "impact": "Account reconciliation scripts report corrupted fee/pnl statistics if funding records are treated as trades.",
+      "remediation": "Filter all Bybit execution streams strictly where execType == 'Trade'."
+    }
+  ]
+}
