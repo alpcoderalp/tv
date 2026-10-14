@@ -29,48 +29,34 @@
         "T-19",
         "T-21"
       ],
-      "description": "Bybit perpetual connector operates in One-Way Mode (positionIdx=0). When the strategy receives a second entry signal in the same symbol and side while a previous trade (or remainder) is open, Bybit aggregates them into a single exchange position with a weighted blended entry price. However, the bot's internal state tracks them as separate dictionary entries, creating an impedance mismatch between exchange risk and bot logic.",
-      "impact": "Stop orders from prior trades are either cancelled or rotated with partial quantities, leading to apparent quantity discrepancies (e.g., 6870 entry closed as 8450; 593 entry closed as 822). Hedge Mode does NOT solve this because Hedge Mode only isolates Buy from Sell, not multiple Buys or multiple Sells.",
-      "remediation": "Implement a strict Concurrency Mutex blocking new entries on the same symbol and side until previous position is fully flat, or route concurrent trades to separate Bybit subaccounts."
+      "description": "Bybit perpetual connector operates in One-Way Mode (positionIdx=0). When the strategy receives a second entry signal in the same symbol and side while a previous trade (or runner) is open, Bybit aggregates them into a single exchange position with a weighted blended entry price. However, the bot's internal state tracks them as separate dictionary entries.",
+      "impact": "Hedge Mode does NOT resolve this because Hedge Mode only isolates Buy from Sell, not multiple concurrent Buys or multiple concurrent Sells.",
+      "remediation": "Enforce a strict Concurrency Mutex blocking new entries on the same symbol and side while any parent position (or runner) is open, or use subaccounts."
     },
     {
       "anomaly_id": "ANOMALY-02",
-      "category": "AGGREGATE_FALLBACK_CANNIBALIZATION",
-      "title": "Stop Order of Secondary Entry Swallows Remainder of Prior Trade (Case #7)",
+      "category": "STOP_CANNIBALIZATION_ROOT_CAUSE",
+      "title": "T-12 Stop Executed 5020 CHIP via Exchange Clamping, Swallowing T-05 Remainder",
       "severity": "HIGH",
       "affected_trades": [
         "T-05",
         "T-12"
       ],
-      "description": "In Trade #7 (T-12), parent 896351516234 entered short 6870 CHIP while parent 18400454197 had 1580 CHIP remaining open. After TP1 closed 3430 CHIP, the stop order H-S-896351516234-BB triggered with closeOnTrigger=True and executed for 5020 CHIP (closing the entire exchange position). This swallowed the 1580 CHIP of parent 18400454197, forcing the bot into an emergency [WS POS CLOSED] size=0 synthetic cleanup (SYNTH_FLAT_18400454197).",
+      "description": "Root Cause: Order 3ba934f0-1bff-4a0a-90dd-6bbc01c4ad12 (CID H-S-896351516234-BB) was created with qty=6870, closeOnTrigger=True, reduceOnly=True. At BE (22:11:41), triggerPrice amended to 0.05737. After TP1 (22:18:33, 3430 CHIP), the bot DID NOT amend the stop order's quantity to 3440. At 22:36:36, when price hit 0.05737, Bybit's exchange matching engine clamped the unamended stop to the open position size (5020 CHIP) and executed it. This swallowed T-05's 1580 CHIP runner. The bot merely reacted to size=0 with a synthetic cleanup (SYNTH_FLAT_18400454197).",
       "impact": "Position isolation is completely broken; prior trade's stop is invalidated and closed without execution of its own stop order.",
-      "remediation": "Do not allow multi-entry on the same side without subaccount isolation."
+      "remediation": "Do not allow multi-entry on the same side without subaccount isolation, and ensure stop quantities are explicitly amended after TP1."
     },
     {
       "anomaly_id": "ANOMALY-03",
-      "category": "LATENCY_WINDOW_PROTECTION",
-      "title": "Stop Loss Cancel-Replace Naked Interval",
+      "category": "UNVERIFIABLE_PROTECTION_WINDOWS",
+      "title": "Stop Loss Cancel-Replace / Transition Latency Window",
       "severity": "MEDIUM",
-      "affected_trades": [
-        "T-12",
-        "T-19",
-        "T-21"
-      ],
-      "description": "When rotating or resizing stop orders, the bot sends a cancel/deactivate request followed by a new stop order placement. During this network round-trip window (approx 150ms-400ms), the exchange position has no active stop loss registered.",
-      "impact": "If a violent market flash-crash occurs during this sub-second interval, liquidation or runaway loss could occur.",
-      "remediation": "Use Bybit /v5/order/amend endpoint or conditional order edit API rather than cancel-and-replace."
-    },
-    {
-      "anomaly_id": "ANOMALY-04",
-      "category": "EXECUTION_TYPE_CONTAMINATION",
-      "title": "Funding Settlements Present in Execution Stream",
-      "severity": "LOW",
       "affected_trades": [
         "ALL"
       ],
-      "description": "Bybit /v5/execution/list returns records where execType=='Funding' alongside execType=='Trade'. If not explicitly filtered, trade reconcilers mistake periodic 8-hour funding cash deductions for zero-quantity order fills.",
-      "impact": "Account reconciliation scripts report corrupted fee/pnl statistics if funding records are treated as trades.",
-      "remediation": "Filter all Bybit execution streams strictly where execType == 'Trade'."
+      "description": "When rotating or resizing stop orders, network latency creates a window where the exchange position may be unprotected. Without microsecond-level exchange matching engine telemetry, unbroken stop protection is unverifiable.",
+      "impact": "Potential flash-crash exposure during order transitions.",
+      "remediation": "Use Bybit /v5/order/amend endpoint rather than cancel-and-replace."
     }
   ]
 }

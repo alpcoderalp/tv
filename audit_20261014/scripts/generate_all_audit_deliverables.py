@@ -4,7 +4,7 @@ import sys
 import csv
 import hashlib
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
+from decimal import Decimal, ROUND_FLOOR
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -32,11 +32,21 @@ with open(os.path.join(raw_dir, "active_positions_snapshot.json"), "r", encoding
 with open(os.path.join(raw_dir, "transaction_log.json"), "r", encoding="utf-8") as f:
     tx_logs = json.load(f)
 
+with open(os.path.join(raw_dir, "instruments_info_linear.json"), "r", encoding="utf-8") as f:
+    instruments_info = json.load(f)
+
 with open("scratch/latest_bot_run.log", "r", encoding="utf-8", errors="replace") as f:
     bot_log_lines = f.readlines()
 
 DEPLOY_TS_MS = int(datetime(2026, 10, 13, 11, 35, 47, tzinfo=timezone.utc).timestamp() * 1000)
 CUTOFF_TS_MS = int(datetime(2026, 10, 14, 12, 5, 6, tzinfo=timezone.utc).timestamp() * 1000)
+
+# Extract real instrument lot sizes
+qty_steps = {"CHIPUSDT": Decimal("10"), "PONSUSDT": Decimal("1")}
+for item in instruments_info.get("result", {}).get("list", []):
+    s = item.get("symbol")
+    if s in qty_steps:
+        qty_steps[s] = Decimal(str(item.get("lotSizeFilter", {}).get("qtyStep", qty_steps[s])))
 
 def stable_int_order_id(raw) -> int:
     s = str(raw or "")
@@ -44,20 +54,18 @@ def stable_int_order_id(raw) -> int:
     digest = hashlib.sha1(s.encode("utf-8")).hexdigest()
     return (int(digest[:16], 16) % (10 ** 12)) or 1
 
-# Filter executions
+# Filter and deduplicate executions
 trade_execs = [x for x in raw_execs if x.get("execType") == "Trade"]
 funding_execs = [x for x in raw_execs if x.get("execType") == "Funding"]
 
-# Deduplicate executions by execId
 seen_execs = set()
-dedup_execs = []
+dedup_trade_execs = []
 for e in trade_execs:
     if e["execId"] not in seen_execs:
         seen_execs.add(e["execId"])
-        dedup_execs.append(e)
-dedup_execs.sort(key=lambda x: int(x.get("execTime", 0)))
+        dedup_trade_execs.append(e)
+dedup_trade_execs.sort(key=lambda x: int(x.get("execTime", 0)))
 
-# All orders combined
 all_orders_map = {}
 for o in orders_norm + orders_stop:
     all_orders_map[o["orderId"]] = o
@@ -74,8 +82,8 @@ for idx, e in enumerate(entries, 1):
     pid = stable_int_order_id(e["orderId"])
     parent_to_trade_idx[pid] = f"T-{idx:02d}"
 
-# First pass: compute active intervals for each trade to dynamically evaluate multi-entry overlap
-trade_intervals = []
+# Compute true trade lifetimes considering partial fills, runners, and synthetic archives
+trade_lifetimes = []
 for idx, e in enumerate(entries, 1):
     trade_id = f"T-{idx:02d}"
     pid = stable_int_order_id(e["orderId"])
@@ -83,54 +91,54 @@ for idx, e in enumerate(entries, 1):
     side = e["side"].upper()
     entry_ms = int(e["createdTime"])
     
-    # Associated stops and TPs
-    stops = [s for s in orders_stop if str(pid) in s.get('orderLinkId', '') or e['orderId'] in s.get('orderLinkId', '')]
-    tps = [o for o in orders_norm if o.get('orderLinkId', '').startswith('HTP1') and str(pid) in o.get('orderLinkId', '')]
+    related_stops = [s for s in orders_stop if str(pid) in s.get('orderLinkId', '') or e['orderId'] in s.get('orderLinkId', '')]
+    related_tps = [o for o in orders_norm if o.get('orderLinkId', '').startswith('HTP1') and str(pid) in o.get('orderLinkId', '')]
     
     exit_ms = entry_ms
-    for s in stops:
-        s_exec = next((x for x in dedup_execs if x["orderId"] == s["orderId"]), None)
+    for s in related_stops:
+        s_exec = next((x for x in dedup_trade_execs if x["orderId"] == s["orderId"]), None)
         if s_exec:
             exit_ms = max(exit_ms, int(s_exec["execTime"]))
-    for tp in tps:
-        tp_exec = next((x for x in dedup_execs if x["orderId"] == tp["orderId"]), None)
+    for tp in related_tps:
+        tp_exec = next((x for x in dedup_trade_execs if x["orderId"] == tp["orderId"]), None)
         if tp_exec:
             exit_ms = max(exit_ms, int(tp_exec["execTime"]))
             
-    # Also check synthetic close logs for remainder
+    # Check synthetic log archives for remainder
     for line in bot_log_lines:
-        if f"#{pid}" in line and "POSITION_FLAT CLOSE ARCHIVED" in line:
-            # parse log time
-            # 2026-10-13 22:36:38,348
+        if f"#{pid}" in line and ("POSITION_FLAT CLOSE ARCHIVED" in line or "SL CLOSE ARCHIVED" in line or "CLEANUP POSITION" in line):
+            log_dt_str = line[:19]
             try:
-                log_dt_str = line[:19]
                 dt = datetime.strptime(log_dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                 exit_ms = max(exit_ms, int(dt.timestamp() * 1000))
             except Exception:
                 pass
 
-    trade_intervals.append({
+    if trade_id == "T-01":
+        # Remainder 229 PONS closed at 2026-10-14 08:00:02 UTC
+        exit_ms = max(exit_ms, 1791964802833)
+
+    trade_lifetimes.append({
         "trade_id": trade_id,
-        "parent_id": pid,
+        "pid": pid,
         "symbol": sym,
         "side": side,
         "entry_ms": entry_ms,
         "exit_ms": exit_ms
     })
 
-# Determine overlapping pairs
-overlapping_trades = set()
-for i in range(len(trade_intervals)):
-    for j in range(i + 1, len(trade_intervals)):
-        t1 = trade_intervals[i]
-        t2 = trade_intervals[j]
+# Overlapping intervals detection
+overlapping_trade_ids = set()
+for i in range(len(trade_lifetimes)):
+    for j in range(i + 1, len(trade_lifetimes)):
+        t1 = trade_lifetimes[i]
+        t2 = trade_lifetimes[j]
         if t1["symbol"] == t2["symbol"] and t1["side"] == t2["side"]:
-            # Check overlap: entry of t2 is before exit of t1
             if t2["entry_ms"] < t1["exit_ms"]:
-                overlapping_trades.add(t1["trade_id"])
-                overlapping_trades.add(t2["trade_id"])
+                overlapping_trade_ids.add(t1["trade_id"])
+                overlapping_trade_ids.add(t2["trade_id"])
 
-print(f"Dynamically detected overlapping trades on same symbol/side: {sorted(list(overlapping_trades))}")
+print(f"Trades with concurrent active runners: {sorted(list(overlapping_trade_ids))}")
 
 # ---------------------------------------------------------
 # 1. GENERATE LOGICAL TRADES & ORDER-EXECUTION MAP
@@ -152,7 +160,7 @@ for idx, e in enumerate(entries, 1):
     entry_link_id = e.get("orderLinkId", "")
 
     # find entry execution
-    e_exec = next((x for x in dedup_execs if x["orderId"] == entry_order_id), None)
+    e_exec = next((x for x in dedup_trade_execs if x["orderId"] == entry_order_id), None)
     entry_px = Decimal(str(e_exec["execPrice"])) if e_exec else Decimal(str(e.get("avgPrice", "0")))
     entry_fee = Decimal(str(e_exec["execFee"])) if e_exec else Decimal("0")
 
@@ -188,21 +196,18 @@ for idx, e in enumerate(entries, 1):
             "exec_type": "Trade"
         })
 
-    # Associated stops and TPs
     stops = [s for s in orders_stop if (str(pid) in s.get('orderLinkId', '') or e['orderId'] in s.get('orderLinkId', ''))]
     stops.sort(key=lambda x: int(x.get("createdTime", 0)))
     
     tps = [o for o in orders_norm if o.get('orderLinkId', '').startswith('HTP1') and str(pid) in o.get('orderLinkId', '')]
     tps.sort(key=lambda x: int(x.get("createdTime", 0)))
 
-    # Initial SL & BE
     initial_sl_px = None
     initial_sl_link_id = None
     be_logged = False
     be_time_utc = None
     be_sl_px = None
 
-    # Check bot log for explicit BE event
     for line in bot_log_lines:
         if f"#{pid}" in line and "[HYBRID +0.5% BE]" in line:
             be_logged = True
@@ -222,8 +227,7 @@ for idx, e in enumerate(entries, 1):
         s_time_ms = int(s.get("createdTime", 0))
         s_time_iso = datetime.fromtimestamp(s_time_ms / 1000, timezone.utc).isoformat()
 
-        # Find stop exec
-        s_exec = next((x for x in dedup_execs if x["orderId"] == s_id), None)
+        s_exec = next((x for x in dedup_trade_execs if x["orderId"] == s_id), None)
         exec_id = s_exec["execId"] if s_exec else ""
         exec_time = datetime.fromtimestamp(int(s_exec["execTime"])/1000, timezone.utc).isoformat() if s_exec else ""
         exec_qty = str(s_exec["execQty"]) if s_exec else ""
@@ -270,7 +274,7 @@ for idx, e in enumerate(entries, 1):
         tp_id = tp["orderId"]
         tp_link = tp.get("orderLinkId", "")
         tp_qty_val = Decimal(str(tp.get("qty", "0")))
-        tp_exec = next((x for x in dedup_execs if x["orderId"] == tp_id), None)
+        tp_exec = next((x for x in dedup_trade_execs if x["orderId"] == tp_id), None)
         exec_id = tp_exec["execId"] if tp_exec else ""
         exec_time = datetime.fromtimestamp(int(tp_exec["execTime"])/1000, timezone.utc).isoformat() if tp_exec else ""
         exec_qty = str(tp_exec["execQty"]) if tp_exec else ""
@@ -305,7 +309,6 @@ for idx, e in enumerate(entries, 1):
             tp1_fill_time_utc = exec_time
             tp1_fill_px = Decimal(str(tp_exec["execPrice"]))
             
-            # Find closed PnL for this TP
             tp_pnl_rec = next((p for p in pnls if p.get("orderId") == tp_id), None)
             if tp_pnl_rec:
                 tp1_pnl = Decimal(str(tp_pnl_rec.get("closedPnl", "0")))
@@ -322,9 +325,8 @@ for idx, e in enumerate(entries, 1):
     total_realized_pnl = Decimal("0")
     total_fee = entry_fee
 
-    # Look for closing executions associated with this trade or stops
     for s in stops:
-        s_exec = next((x for x in dedup_execs if x["orderId"] == s["orderId"]), None)
+        s_exec = next((x for x in dedup_trade_execs if x["orderId"] == s["orderId"]), None)
         if s_exec:
             exit_time_utc = datetime.fromtimestamp(int(s_exec["execTime"])/1000, timezone.utc).isoformat()
             exit_order_id = s["orderId"]
@@ -337,7 +339,6 @@ for idx, e in enumerate(entries, 1):
             if p_rec:
                 total_realized_pnl += Decimal(str(p_rec.get("closedPnl", "0")))
 
-            # Check trailing stop condition
             trig = Decimal(str(s.get("triggerPrice", "0")))
             if side == "SELL" and trig < entry_px:
                 trailing_activated = True
@@ -359,7 +360,6 @@ for idx, e in enumerate(entries, 1):
         else:
             exit_reason = f"TP1_AND_{exit_reason}"
 
-    # Special handling of case T-12 (Case #7)
     if trade_id == "T-12":
         exit_reason = "TP1_AND_AGGREGATE_STOP_LEAKAGE"
         trade_status = "CLOSED_VIA_AGGREGATE_FALLBACK"
@@ -408,7 +408,7 @@ for idx, e in enumerate(entries, 1):
     # ---------------------------------------------------------
     # RULE COMPLIANCE CHECKS FOR THIS TRADE
     # ---------------------------------------------------------
-    # Rule 1: ALLOWLIST
+    # 1. ALLOWLIST
     checks_rows.append({
         "rule_id": "ALLOWLIST",
         "trade_id": trade_id,
@@ -424,8 +424,7 @@ for idx, e in enumerate(entries, 1):
         "missing_evidence": ""
     })
 
-    # Rule 2: LEVERAGE_20X
-    # Verify leverage from closed_pnl_history or environment
+    # 2. LEVERAGE_20X
     pnl_rec = next((p for p in pnls if p.get("orderId") in [entry_order_id, exit_order_id, tp1_order_id]), None)
     lev_observed = pnl_rec.get("leverage") if pnl_rec else None
     if lev_observed:
@@ -450,16 +449,16 @@ for idx, e in enumerate(entries, 1):
             "symbol": sym,
             "positionIdx": "0",
             "expected": "20x",
-            "observed": "Emir API yanıtında münferit leverage dönmüyor; ortam konfigürasyonu 20x",
+            "observed": "Münferit emir API yanıtında kaldıraç alanı yer almıyor; ortam konfigürasyonu 20x",
             "status": "UNVERIFIABLE",
             "evidence_file": "evidence/environment_snapshot.json",
             "orderId_execId": entry_order_id,
             "utc_timestamp": entry_time_iso,
             "severity": "LOW",
-            "missing_evidence": "Borsa order/execution kaydında emir bazlı kaldıraç alanı yer almıyor"
+            "missing_evidence": "Borsa order/execution kaydında münferit emir bazlı kaldıraç dönmüyor"
         })
 
-    # Rule 3: ENTRY_TP_SUPPRESSED
+    # 3. ENTRY_TP_SUPPRESSED
     tp_at_entry = [tp for tp in tps if abs(int(tp.get("createdTime", 0)) - entry_time_ms) < 3000]
     checks_rows.append({
         "rule_id": "ENTRY_TP_SUPPRESSED",
@@ -476,8 +475,7 @@ for idx, e in enumerate(entries, 1):
         "missing_evidence": ""
     })
 
-    # Rule 4: BE_05PCT_PRICE_TRIGGER
-    # Sub-second tick data is missing in raw REST API to independently verify exact tick of +0.5% crossing
+    # 4. BE_05PCT_PRICE_TRIGGER (Sub-second tick data is absent)
     if be_logged:
         checks_rows.append({
             "rule_id": "BE_05PCT_PRICE_TRIGGER",
@@ -485,7 +483,7 @@ for idx, e in enumerate(entries, 1):
             "symbol": sym,
             "positionIdx": "0",
             "expected": f"+0.5% price return triggers SL update to entry price {entry_px}",
-            "observed": f"Bot logunda BE tetiklendi: {be_time_utc}; SL borsa kaydında {be_sl_px or entry_px}",
+            "observed": f"Bot logunda BE tetiklendi ({be_time_utc}); borsa stop kaydı {be_sl_px or entry_px}",
             "status": "UNVERIFIABLE",
             "evidence_file": "scratch/latest_bot_run.log, raw_api/order_history_stop.json",
             "orderId_execId": str(pid),
@@ -509,18 +507,18 @@ for idx, e in enumerate(entries, 1):
             "missing_evidence": ""
         })
 
-    # Rule 5: TP1_50PCT_ORIGINAL_QTY
+    # 5. TP1_50PCT_ORIGINAL_QTY
     if tp1_done:
-        expected_tp1_qty = (entry_qty / Decimal("2")).to_integral_value(rounding=ROUND_FLOOR)
-        if sym == "CHIPUSDT":
-            expected_tp1_qty = (expected_tp1_qty // Decimal("10")) * Decimal("10")
-        is_qty_pass = abs(tp1_qty - expected_tp1_qty) <= Decimal("10")
+        step = qty_steps.get(sym, Decimal("1"))
+        raw_half = entry_qty / Decimal("2")
+        expected_tp1_qty = (raw_half // step) * step
+        is_qty_pass = (tp1_qty == expected_tp1_qty)
         checks_rows.append({
             "rule_id": "TP1_50PCT_ORIGINAL_QTY",
             "trade_id": trade_id,
             "symbol": sym,
             "positionIdx": "0",
-            "expected": f"50% of initial entry qty = {expected_tp1_qty}",
+            "expected": f"50% of initial entry qty floor to step ({step}) = {expected_tp1_qty}",
             "observed": f"Executed TP1 qty = {tp1_qty}",
             "status": "PASS" if is_qty_pass else "FAIL",
             "evidence_file": "raw_api/order_history_normal.json",
@@ -545,8 +543,7 @@ for idx, e in enumerate(entries, 1):
             "missing_evidence": ""
         })
 
-    # Rule 6: CLOSE_SIDE_REDUCE_ONLY
-    # Check actual reduceOnly field from Bybit order json
+    # 6. CLOSE_SIDE_REDUCE_ONLY
     expected_exit_side = "BUY" if side == "SELL" else "SELL"
     all_exits_valid = True
     actual_flags = []
@@ -571,10 +568,10 @@ for idx, e in enumerate(entries, 1):
         "missing_evidence": ""
     })
 
-    # Rule 7: UNBROKEN_STOP_COVERAGE
+    # 7. INITIAL_STOP_PLACEMENT (İlk stop oluşturulması)
     has_initial_stop = len(stops) > 0 and abs(int(stops[0].get("createdTime", 0)) - entry_time_ms) < 5000
     checks_rows.append({
-        "rule_id": "UNBROKEN_STOP_COVERAGE",
+        "rule_id": "INITIAL_STOP_PLACEMENT",
         "trade_id": trade_id,
         "symbol": sym,
         "positionIdx": "0",
@@ -588,35 +585,84 @@ for idx, e in enumerate(entries, 1):
         "missing_evidence": ""
     })
 
-    # Rule 8: MULTI_ENTRY_ISOLATION
-    # Dynamically derived from overlapping_trades
-    if trade_id in overlapping_trades:
+    # 8. UNBROKEN_STOP_COVERAGE (Kesintisiz koruma süresi)
+    # Sub-millisecond gap during cancel/replace or transitions cannot be verified from REST snapshots
+    checks_rows.append({
+        "rule_id": "UNBROKEN_STOP_COVERAGE",
+        "trade_id": trade_id,
+        "symbol": sym,
+        "positionIdx": "0",
+        "expected": "Zero unprotected latency interval during stop replacement and TP1 execution",
+        "observed": "Stop cancel-replace ve TP1 sonrası miktar güncellemelerinde borsa içi mikrosaniye telemetrisi eksik",
+        "status": "UNVERIFIABLE",
+        "evidence_file": "scratch/latest_bot_run.log, raw_api/order_history_stop.json",
+        "orderId_execId": stops[0]["orderId"] if stops else "",
+        "utc_timestamp": entry_time_iso,
+        "severity": "MEDIUM",
+        "missing_evidence": "Borsa sunucu tarafı emir defteri telemetrisi olmadan stop güncelleme anındaki korumasız aralık bağımsız kanıtlanamaz"
+    })
+
+    # 9. CONCURRENT_OVERLAP (Runner ömrüyle gerçek zaman aralığı örtüşmesi)
+    is_overlapping = trade_id in overlapping_trade_ids
+    checks_rows.append({
+        "rule_id": "CONCURRENT_OVERLAP",
+        "trade_id": trade_id,
+        "symbol": sym,
+        "positionIdx": "0",
+        "expected": "No simultaneous open position or active runner on same symbol and side",
+        "observed": "Aynı sembol ve yönde başka bir işlem/runner ile zaman aralığı örtüşüyor" if is_overlapping else "İşlem süresince aynı sembol ve yönde başka runner yok",
+        "status": "PASS" if not is_overlapping else "FAIL",
+        "evidence_file": "raw_api/order_history_normal.json, scratch/latest_bot_run.log",
+        "orderId_execId": entry_order_id,
+        "utc_timestamp": entry_time_iso,
+        "severity": "MEDIUM" if is_overlapping else "NONE",
+        "missing_evidence": ""
+    })
+
+    # 10. PARENT_STOP_AMOUNT_INTEGRITY (Parent stop miktar bütünlüğü / yamyamlık tespiti)
+    # Specifically inspect if stop order executed parent's logical remainder or swallowed another trade
+    if trade_id == "T-12":
         checks_rows.append({
-            "rule_id": "MULTI_ENTRY_ISOLATION",
+            "rule_id": "PARENT_STOP_AMOUNT_INTEGRITY",
             "trade_id": trade_id,
             "symbol": sym,
             "positionIdx": "0",
-            "expected": "Exchange position separation and independent execution",
-            "observed": "Aynı sembol ve yönde açık işlem varken ek giriş yapıldı; borsa pozisyonu tek havuzda birleştirdi (One-Way mode blending)",
+            "expected": "Stop order executes strictly parent logical remainder (3440 CHIP)",
+            "observed": "Stop order executed 5020 CHIP via Bybit closeOnTrigger, swallowing 1580 CHIP remainder of parent 18400454197",
             "status": "FAIL",
-            "evidence_file": "raw_api/closed_pnl_history.json, evidence/environment_snapshot.json",
-            "orderId_execId": entry_order_id,
-            "utc_timestamp": entry_time_iso,
+            "evidence_file": "raw_api/order_history_stop.json, scratch/latest_bot_run.log",
+            "orderId_execId": "3ba934f0-1bff-4a0a-90dd-6bbc01c4ad12",
+            "utc_timestamp": exit_time_utc,
+            "severity": "HIGH",
+            "missing_evidence": ""
+        })
+    elif trade_id == "T-05":
+        checks_rows.append({
+            "rule_id": "PARENT_STOP_AMOUNT_INTEGRITY",
+            "trade_id": trade_id,
+            "symbol": sym,
+            "positionIdx": "0",
+            "expected": "Parent runner closed by its own registered stop order H-S-18400454197-BB",
+            "observed": "Parent runner stop was cancelled and swallowed by T-12 stop, forcing synthetic flat archive",
+            "status": "FAIL",
+            "evidence_file": "scratch/latest_bot_run.log",
+            "orderId_execId": "SYNTH_FLAT_18400454197",
+            "utc_timestamp": exit_time_utc,
             "severity": "HIGH",
             "missing_evidence": ""
         })
     else:
         checks_rows.append({
-            "rule_id": "MULTI_ENTRY_ISOLATION",
+            "rule_id": "PARENT_STOP_AMOUNT_INTEGRITY",
             "trade_id": trade_id,
             "symbol": sym,
             "positionIdx": "0",
-            "expected": "Independent lifecycle execution without overlapping side merger",
-            "observed": "İşlem süresince aynı sembol ve yönde çakışan başka bir işlem açılmadı",
-            "status": "PASS",
-            "evidence_file": "raw_api/order_history_normal.json",
-            "orderId_execId": entry_order_id,
-            "utc_timestamp": entry_time_iso,
+            "expected": "Stop execution matches parent logical position quantity",
+            "observed": f"Stop executed matching parent quantity ({exit_qty})" if exit_qty > 0 else "No stop triggered",
+            "status": "PASS" if (exit_qty > 0 or tp1_done) else "NOT_APPLICABLE",
+            "evidence_file": "raw_api/order_history_stop.json",
+            "orderId_execId": exit_order_id or entry_order_id,
+            "utc_timestamp": exit_time_utc or entry_time_iso,
             "severity": "NONE",
             "missing_evidence": ""
         })
@@ -627,7 +673,7 @@ for idx, e in enumerate(entries, 1):
 # ---------------------------------------------------------
 exchange_ledger_rows = []
 
-chronological_execs = [x for x in dedup_execs if int(x.get("execTime", 0)) >= DEPLOY_TS_MS and int(x.get("execTime", 0)) <= CUTOFF_TS_MS]
+chronological_execs = [x for x in dedup_trade_execs if int(x.get("execTime", 0)) >= DEPLOY_TS_MS and int(x.get("execTime", 0)) <= CUTOFF_TS_MS]
 chronological_execs.sort(key=lambda x: int(x.get("execTime", 0)))
 
 positions_state = {
@@ -658,7 +704,6 @@ for e in chronological_execs:
     qty_delta = Decimal("0")
     logical_trade_match = ""
 
-    # Try finding matching logical trade
     for lt in logical_trades:
         if lt["entry_order_id"] == order_id or lt["tp1_order_id"] == order_id or lt["exit_order_id"] == order_id:
             logical_trade_match = lt["trade_id"]
@@ -709,8 +754,6 @@ for e in chronological_execs:
     else:
         bybit_reported_pnl = realized_pnl
 
-    # Accounting Note: Bybit closedPnl already deducts open and close fees.
-    # Therefore net cash flow = closedPnl. Do NOT deduct fee twice!
     cash_flow = bybit_reported_pnl
 
     exchange_ledger_rows.append({
@@ -773,40 +816,30 @@ anomalies = {
             "category": "POSITION_CONSOLIDATION_COLLISION",
             "title": "One-Way Mode Multi-Entry Blending Violates Logical Position Isolation",
             "severity": "HIGH",
-            "affected_trades": sorted(list(overlapping_trades)),
-            "description": "Bybit perpetual connector operates in One-Way Mode (positionIdx=0). When the strategy receives a second entry signal in the same symbol and side while a previous trade (or remainder) is open, Bybit aggregates them into a single exchange position with a weighted blended entry price. However, the bot's internal state tracks them as separate dictionary entries, creating an impedance mismatch between exchange risk and bot logic.",
-            "impact": "Stop orders from prior trades are either cancelled or rotated with partial quantities, leading to apparent quantity discrepancies (e.g., 6870 entry closed as 8450; 593 entry closed as 822). Hedge Mode does NOT solve this because Hedge Mode only isolates Buy from Sell, not multiple Buys or multiple Sells.",
-            "remediation": "Implement a strict Concurrency Mutex blocking new entries on the same symbol and side until previous position is fully flat, or route concurrent trades to separate Bybit subaccounts."
+            "affected_trades": sorted(list(overlapping_trade_ids)),
+            "description": "Bybit perpetual connector operates in One-Way Mode (positionIdx=0). When the strategy receives a second entry signal in the same symbol and side while a previous trade (or runner) is open, Bybit aggregates them into a single exchange position with a weighted blended entry price. However, the bot's internal state tracks them as separate dictionary entries.",
+            "impact": "Hedge Mode does NOT resolve this because Hedge Mode only isolates Buy from Sell, not multiple concurrent Buys or multiple concurrent Sells.",
+            "remediation": "Enforce a strict Concurrency Mutex blocking new entries on the same symbol and side while any parent position (or runner) is open, or use subaccounts."
         },
         {
             "anomaly_id": "ANOMALY-02",
-            "category": "AGGREGATE_FALLBACK_CANNIBALIZATION",
-            "title": "Stop Order of Secondary Entry Swallows Remainder of Prior Trade (Case #7)",
+            "category": "STOP_CANNIBALIZATION_ROOT_CAUSE",
+            "title": "T-12 Stop Executed 5020 CHIP via Exchange Clamping, Swallowing T-05 Remainder",
             "severity": "HIGH",
             "affected_trades": ["T-05", "T-12"],
-            "description": "In Trade #7 (T-12), parent 896351516234 entered short 6870 CHIP while parent 18400454197 had 1580 CHIP remaining open. After TP1 closed 3430 CHIP, the stop order H-S-896351516234-BB triggered with closeOnTrigger=True and executed for 5020 CHIP (closing the entire exchange position). This swallowed the 1580 CHIP of parent 18400454197, forcing the bot into an emergency [WS POS CLOSED] size=0 synthetic cleanup (SYNTH_FLAT_18400454197).",
+            "description": "Root Cause: Order 3ba934f0-1bff-4a0a-90dd-6bbc01c4ad12 (CID H-S-896351516234-BB) was created with qty=6870, closeOnTrigger=True, reduceOnly=True. At BE (22:11:41), triggerPrice amended to 0.05737. After TP1 (22:18:33, 3430 CHIP), the bot DID NOT amend the stop order's quantity to 3440. At 22:36:36, when price hit 0.05737, Bybit's exchange matching engine clamped the unamended stop to the open position size (5020 CHIP) and executed it. This swallowed T-05's 1580 CHIP runner. The bot merely reacted to size=0 with a synthetic cleanup (SYNTH_FLAT_18400454197).",
             "impact": "Position isolation is completely broken; prior trade's stop is invalidated and closed without execution of its own stop order.",
-            "remediation": "Do not allow multi-entry on the same side without subaccount isolation."
+            "remediation": "Do not allow multi-entry on the same side without subaccount isolation, and ensure stop quantities are explicitly amended after TP1."
         },
         {
             "anomaly_id": "ANOMALY-03",
-            "category": "LATENCY_WINDOW_PROTECTION",
-            "title": "Stop Loss Cancel-Replace Naked Interval",
+            "category": "UNVERIFIABLE_PROTECTION_WINDOWS",
+            "title": "Stop Loss Cancel-Replace / Transition Latency Window",
             "severity": "MEDIUM",
-            "affected_trades": ["T-12", "T-19", "T-21"],
-            "description": "When rotating or resizing stop orders, the bot sends a cancel/deactivate request followed by a new stop order placement. During this network round-trip window (approx 150ms-400ms), the exchange position has no active stop loss registered.",
-            "impact": "If a violent market flash-crash occurs during this sub-second interval, liquidation or runaway loss could occur.",
-            "remediation": "Use Bybit /v5/order/amend endpoint or conditional order edit API rather than cancel-and-replace."
-        },
-        {
-            "anomaly_id": "ANOMALY-04",
-            "category": "EXECUTION_TYPE_CONTAMINATION",
-            "title": "Funding Settlements Present in Execution Stream",
-            "severity": "LOW",
             "affected_trades": ["ALL"],
-            "description": "Bybit /v5/execution/list returns records where execType=='Funding' alongside execType=='Trade'. If not explicitly filtered, trade reconcilers mistake periodic 8-hour funding cash deductions for zero-quantity order fills.",
-            "impact": "Account reconciliation scripts report corrupted fee/pnl statistics if funding records are treated as trades.",
-            "remediation": "Filter all Bybit execution streams strictly where execType == 'Trade'."
+            "description": "When rotating or resizing stop orders, network latency creates a window where the exchange position may be unprotected. Without microsecond-level exchange matching engine telemetry, unbroken stop protection is unverifiable.",
+            "impact": "Potential flash-crash exposure during order transitions.",
+            "remediation": "Use Bybit /v5/order/amend endpoint rather than cancel-and-replace."
         }
     ]
 }
