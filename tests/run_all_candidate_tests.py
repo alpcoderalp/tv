@@ -15,9 +15,11 @@ suite = unittest.TestSuite()
 
 import test_strict_terminal_fix
 import test_quantize_verify_fix
+import test_end_to_end_lifecycle
 
 suite.addTests(loader.loadTestsFromModule(test_strict_terminal_fix))
 suite.addTests(loader.loadTestsFromModule(test_quantize_verify_fix))
+suite.addTests(loader.loadTestsFromModule(test_end_to_end_lifecycle))
 
 runner = unittest.TextTestRunner(verbosity=2)
 result = runner.run(suite)
@@ -31,3 +33,4 @@ if result.wasSuccessful():
 else:
     print("TESTS FAILED!")
     sys.exit(1)
+
