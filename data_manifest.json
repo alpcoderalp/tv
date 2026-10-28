@@ -1,10 +1,11 @@
 {
-  "manifest_version": "2.0",
-  "generation_time_utc": "2026-10-28 14:35:00 UTC",
+  "manifest_version": "3.0",
+  "generation_time_utc": "2026-10-28 15:30:00 UTC",
   "analysis_cohort": {
     "start_cutoff_utc": "2026-10-23 09:31:39 UTC",
     "start_cutoff_timestamp_ms": 1792747899000,
     "end_cutoff_utc": "2026-10-28 13:00:00 UTC",
+    "end_cutoff_timestamp_ms": 1793192400000,
     "cohort_parent_count": 113,
     "cohort_closed_pnl_record_count": 173,
     "cohort_net_realized_pnl_usdt": 8.994129,
@@ -14,13 +15,13 @@
     "pre_cutoff_closures_pnl_usdt": 3.138487
   },
   "file_sha256": {
-    ".gitignore": "862263fa1f46c20f0d1e4dac5ffcc75abd55c08211b2c3864c5f8764b9d87793",
+    ".gitignore": "63eddd28d1afe2b03909e48eb4624f3767e0c986b61b901c50eeed802ed01ac6",
     "bb1_impact.csv": "c3a11d682f2f1e8c8c7186487784c77f484526f13a504ca8985bde04ccd8c1fd",
-    "EVIDENCE_REPORT.md": "f8fb4b92e1c8e91261bf13e58ed686258cac8be5f1edfae2b34f0f30bfaaf0d6",
-    "execution_allocation_ledger.csv": "dca9cb12281e0a950726a03202ce11dedd5521dc3248ba64ca4c25495520006d",
-    "parent_ledger.csv": "7da3a7a5abad570ee6f3aec276f2fb841f4ffac2202e752babea046fe3040112",
-    "replay_engine.py": "be3ccc781fc503cd932536109825a17df2b93add084d80061ada1c0d5f557e8b",
-    "reproduce_audit.py": "aeb632c13c83fc00fe3cc7d19cfa6eb1a32e40616ea5bc183b6f3837c6cf40a8",
+    "EVIDENCE_REPORT.md": "522bcbc51a4267b6cc8d2e94f5b11749019827facf5790c9ade18f36d91c6fd5",
+    "execution_allocation_ledger.csv": "06c1ad6aa13bf73d9c0f48ad04f39c593c3b2fc68f7815a9c042b24ca3d98156",
+    "parent_ledger.csv": "3d654abe6644e3769b92f05089878c4c65c9d4cac20eb00357ecd808cde1c162",
+    "replay_engine.py": "300f36b0dca3e956d74f0ec8e325b10e36897f0af612bea25ede9ab79496eb7a",
+    "reproduce_audit.py": "f369e7908aa04db93742d554e279f8343b8dbe098717af2bb1068322df08efa2",
     "retry_timeline.csv": "a8924b1062b098ff53e713d126eda7ef2ad89b5ed6f957e9e2e71e557e39601c",
     "strategy_version_51F6CDD4.py": "51f6cdd4c38b680a33273aabdd974120a318a9f6e340504024f4b8d02819f637",
     "tv_signal_strategy.py": "bb6eb8fe9a4c6fb2969c6728d62c24711381a8f0bf1465ef81247161c4fc21a0",
@@ -64,18 +65,21 @@
     "data\\klines\\CHIPUSDT_mark_1m.json": "de80d5e34884bc6ff96df1c9fac1c6d5fed884a6aba11029bfad34fefde7282d",
     "data\\klines\\PONSUSDT_last_1m.json": "2939b9d0ef330497fbe92c4d984edff0587117dd95925ceaf21e740074aa10b9",
     "data\\klines\\PONSUSDT_mark_1m.json": "343f7ca41c84a8dd5d6c476f6c103c6072fd508d399e70c1e2b56a675f99a98a",
-    "__pycache__\\replay_engine.cpython-312.pyc": "4b463e38b63d3ac1e4896e9e9a5310bca76ecf11491ed30e2b9fe57b64e5542d"
+    "__pycache__\\replay_engine.cpython-312.pyc": "6bc95e69282d0dcafbb8be49edde650e95b36fcc2a12721741dac3f652767733"
   },
-  "replay_sensitivity_matrix": {
+  "replay_metrics_summary": {
     "actual_bot_realized_pnl_usdt": 8.994129,
-    "pure_replay_pessimistic_net_usdt": -25.0126,
-    "pure_replay_optimistic_net_usdt": -24.8322,
-    "sensitivity_4h_timeout_pessimistic_net_usdt": -47.5314,
-    "fee_rate_assumptions": {
+    "standard_replay_realized_net_usdt": 15.9368,
+    "standard_replay_unrealized_net_usdt": 3.7512,
+    "standard_replay_combined_total_net_usdt": 19.688,
+    "stress_worst_candle_replay_total_net_usdt": -25.1565,
+    "intra_bar_tp1_sl_ambiguity_trades": 0,
+    "intra_bar_be_trailing_ambiguity_trades": 1,
+    "fee_structure": {
+      "entry_taker_fee": "0.055%",
       "sl_market_order_taker_fee": "0.055%",
-      "tp1_limit_order_maker_fee": "0.020%",
-      "entry_order_taker_fee": "0.055%"
+      "tp1_limit_order_maker_fee": "0.020%"
     },
-    "interpretation_note": "Replay demonstrates that intrinsic strategy performance is heavily fee-sensitive in chop; software fixes do NOT guarantee +X profit, but eliminate operational hazards (sibling position liquidation, 9k retry storms)."
+    "interpretation_rule": "Replay is a diagnostic sensitivity tool, not a performance proof. Software defect fixes are evaluated strictly on execution accounting and operational safety, independent of replay profit."
   }
 }

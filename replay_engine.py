@@ -2,6 +2,7 @@
 Deterministic Replay Engine for Hummingbot TV Signal Strategy Audit
 Replays exact strategy rules on 1-minute LastPrice and MarkPrice Bybit klines.
 Fully self-contained: loads data from data/ directory.
+Strictly respects cohort start (2026-10-23 09:31:39 UTC) and end (2026-10-28 13:00:00 UTC) cutoffs.
 """
 
 import os
@@ -12,10 +13,15 @@ import argparse
 from datetime import datetime, timezone
 from collections import defaultdict
 
+START_CUTOFF_MS = 1792747899000  # 2026-10-23 09:31:39 UTC
+END_CUTOFF_MS   = 1793192400000  # 2026-10-28 13:00:00 UTC
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Deterministic Strategy Replay Engine")
     parser.add_argument("--mode", choices=["pessimistic", "optimistic"], default="pessimistic",
                         help="Intra-candle tie-breaker mode for same-bar TP1/SL conflict")
+    parser.add_argument("--slippage", choices=["standard", "stress_worst_candle"], default="standard",
+                        help="Execution model: 'standard' fills at trigger SL, 'stress_worst_candle' fills at extreme candle wick")
     parser.add_argument("--with-4h-timeout", action="store_true", default=False,
                         help="Enable artificial 4-hour timeout (sensitivity test only)")
     parser.add_argument("--taker-fee", type=float, default=0.00055,
@@ -26,7 +32,8 @@ def parse_args():
                         help="Optional CSV output path for per-parent replay results")
     return parser.parse_args()
 
-def run_replay(mode="pessimistic", with_4h_timeout=False, taker_fee=0.00055, maker_fee=0.00020):
+def run_replay(mode="pessimistic", slippage="standard", with_4h_timeout=False,
+               taker_fee=0.00055, maker_fee=0.00020):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(base_dir, 'data')
 
@@ -48,7 +55,8 @@ def run_replay(mode="pessimistic", with_4h_timeout=False, taker_fee=0.00055, mak
 
     tick_sizes = {'CHIPUSDT': 0.00001, 'PONSUSDT': 0.0001}
     results = {}
-    ambiguity_count = 0
+    tp1_sl_ambiguities = 0
+    be_trailing_ambiguities = 0
 
     for pid, p in cohort_parents.items():
         sym = p['symbol']
@@ -66,18 +74,21 @@ def run_replay(mode="pessimistic", with_4h_timeout=False, taker_fee=0.00055, mak
         last_dict = pons_last if 'PONS' in sym else chip_last
         mark_dict = pons_mark if 'PONS' in sym else chip_mark
 
-        common_ts = sorted([ts for ts in last_dict if ts >= start_ts and ts in mark_dict])
+        # STRICT END CUTOFF: only bars where start_ts <= ts <= END_CUTOFF_MS
+        common_ts = sorted([ts for ts in last_dict if start_ts <= ts <= END_CUTOFF_MS and ts in mark_dict])
         if not common_ts or entry_px <= 0 or baseline_sl <= 0:
             results[pid] = {
                 'parent_id': pid, 'symbol': sym, 'side': side, 'entry_price': entry_px, 'qty': entry_qty,
-                'status': 'NO_DATA', 'gross_pnl': 0.0, 'fees_paid': 0.0, 'net_pnl': 0.0, 'tp1_hit': False,
-                'close_reason': 'NO_DATA', 'bars_held': 0
+                'status': 'NO_DATA', 'close_reason': 'NO_DATA', 'tp1_hit': False, 'bars_held': 0,
+                'realized_gross': 0.0, 'realized_fees': 0.0, 'realized_net': 0.0,
+                'unrealized_gross': 0.0, 'unrealized_net': 0.0, 'total_net': 0.0,
+                'ambiguity_tp1_sl': False, 'ambiguity_be_trailing': False, 'final_sl': baseline_sl
             }
             continue
 
         rem_qty = entry_qty
-        gross_pnl = 0.0
-        fees_paid = entry_qty * entry_px * taker_fee  # Entry taker fee
+        realized_gross = 0.0
+        realized_fees = entry_qty * entry_px * taker_fee  # Entry taker fee
         tp1_hit = False
         current_sl = baseline_sl
         peak_px = entry_px
@@ -85,7 +96,8 @@ def run_replay(mode="pessimistic", with_4h_timeout=False, taker_fee=0.00055, mak
         close_reason = ''
         close_ts = None
         bars_held = 0
-        experienced_ambiguity = False
+        experienced_tp1_sl_ambiguity = False
+        experienced_be_trailing_ambiguity = False
 
         for idx, ts in enumerate(common_ts):
             bars_held += 1
@@ -98,8 +110,9 @@ def run_replay(mode="pessimistic", with_4h_timeout=False, taker_fee=0.00055, mak
             # Optional 4-hour exit check
             if with_4h_timeout and bars_held >= 240:
                 exit_px = l_close
-                gross_pnl += rem_qty * ((exit_px - entry_px) if side == 'LONG' else (entry_px - exit_px))
-                fees_paid += rem_qty * exit_px * taker_fee
+                realized_gross += rem_qty * ((exit_px - entry_px) if side == 'LONG' else (entry_px - exit_px))
+                realized_fees += rem_qty * exit_px * taker_fee
+                rem_qty = 0.0
                 closed = True
                 close_reason = 'TIMEOUT_4H'
                 close_ts = ts
@@ -111,15 +124,16 @@ def run_replay(mode="pessimistic", with_4h_timeout=False, taker_fee=0.00055, mak
                 last_hits_tp1 = (l_high >= r1) if not tp1_hit else False
 
                 if mark_hits_sl and last_hits_tp1 and not tp1_hit:
-                    experienced_ambiguity = True
-                    ambiguity_count += 1
+                    experienced_tp1_sl_ambiguity = True
+                    tp1_sl_ambiguities += 1
 
                 if mode == 'pessimistic':
-                    # Pessimistic: SL checked first
+                    # Pessimistic: check SL first
                     if mark_hits_sl:
-                        exit_px = min(current_sl, l_low)
-                        gross_pnl += rem_qty * (exit_px - entry_px)
-                        fees_paid += rem_qty * exit_px * taker_fee
+                        exit_px = min(current_sl, l_low) if slippage == 'stress_worst_candle' else current_sl
+                        realized_gross += rem_qty * (exit_px - entry_px)
+                        realized_fees += rem_qty * exit_px * taker_fee
+                        rem_qty = 0.0
                         closed = True
                         close_reason = 'SL_TRIGGERED'
                         close_ts = ts
@@ -128,32 +142,41 @@ def run_replay(mode="pessimistic", with_4h_timeout=False, taker_fee=0.00055, mak
                     if last_hits_tp1:
                         tp1_hit = True
                         tp_qty = round(entry_qty * 0.5, 0 if sym == 'CHIPUSDT' else 1)
-                        gross_pnl += tp_qty * (r1 - entry_px)
-                        fees_paid += tp_qty * r1 * maker_fee  # Limit maker fee
+                        realized_gross += tp_qty * (r1 - entry_px)
+                        realized_fees += tp_qty * r1 * maker_fee  # Limit maker fee
                         rem_qty -= tp_qty
-                        current_sl = max(current_sl, entry_px)  # Move to BE
-                        # If same bar also breaches BE
-                        if m_low <= current_sl:
-                            exit_px = min(current_sl, l_low)
-                            gross_pnl += rem_qty * (exit_px - entry_px)
-                            fees_paid += rem_qty * exit_px * taker_fee
+                        new_sl = max(current_sl, entry_px)  # Move to BE
+                        # Same-bar BE check
+                        if m_low <= new_sl:
+                            experienced_be_trailing_ambiguity = True
+                            be_trailing_ambiguities += 1
+                            exit_px = min(new_sl, l_low) if slippage == 'stress_worst_candle' else new_sl
+                            realized_gross += rem_qty * (exit_px - entry_px)
+                            realized_fees += rem_qty * exit_px * taker_fee
+                            rem_qty = 0.0
                             closed = True
                             close_reason = 'TP1_THEN_BE_SAME_BAR'
                             close_ts = ts
                             break
+                        current_sl = new_sl
                 else:
-                    # Optimistic: TP1 checked first
+                    # Optimistic: check TP1 first
                     if last_hits_tp1:
                         tp1_hit = True
                         tp_qty = round(entry_qty * 0.5, 0 if sym == 'CHIPUSDT' else 1)
-                        gross_pnl += tp_qty * (r1 - entry_px)
-                        fees_paid += tp_qty * r1 * maker_fee
+                        realized_gross += tp_qty * (r1 - entry_px)
+                        realized_fees += tp_qty * r1 * maker_fee
                         rem_qty -= tp_qty
-                        current_sl = max(current_sl, entry_px)
+                        new_sl = max(current_sl, entry_px)
+                        if m_low <= new_sl:
+                            experienced_be_trailing_ambiguity = True
+                            be_trailing_ambiguities += 1
+                        current_sl = new_sl
                     elif mark_hits_sl:
-                        exit_px = min(current_sl, l_low)
-                        gross_pnl += rem_qty * (exit_px - entry_px)
-                        fees_paid += rem_qty * exit_px * taker_fee
+                        exit_px = min(current_sl, l_low) if slippage == 'stress_worst_candle' else current_sl
+                        realized_gross += rem_qty * (exit_px - entry_px)
+                        realized_fees += rem_qty * exit_px * taker_fee
+                        rem_qty = 0.0
                         closed = True
                         close_reason = 'SL_TRIGGERED'
                         close_ts = ts
@@ -179,14 +202,15 @@ def run_replay(mode="pessimistic", with_4h_timeout=False, taker_fee=0.00055, mak
                 last_hits_tp1 = (l_low <= r1) if not tp1_hit else False
 
                 if mark_hits_sl and last_hits_tp1 and not tp1_hit:
-                    experienced_ambiguity = True
-                    ambiguity_count += 1
+                    experienced_tp1_sl_ambiguity = True
+                    tp1_sl_ambiguities += 1
 
                 if mode == 'pessimistic':
                     if mark_hits_sl:
-                        exit_px = max(current_sl, l_high)
-                        gross_pnl += rem_qty * (entry_px - exit_px)
-                        fees_paid += rem_qty * exit_px * taker_fee
+                        exit_px = max(current_sl, l_high) if slippage == 'stress_worst_candle' else current_sl
+                        realized_gross += rem_qty * (entry_px - exit_px)
+                        realized_fees += rem_qty * exit_px * taker_fee
+                        rem_qty = 0.0
                         closed = True
                         close_reason = 'SL_TRIGGERED'
                         close_ts = ts
@@ -195,30 +219,39 @@ def run_replay(mode="pessimistic", with_4h_timeout=False, taker_fee=0.00055, mak
                     if last_hits_tp1:
                         tp1_hit = True
                         tp_qty = round(entry_qty * 0.5, 0 if sym == 'CHIPUSDT' else 1)
-                        gross_pnl += tp_qty * (entry_px - r1)
-                        fees_paid += tp_qty * r1 * maker_fee
+                        realized_gross += tp_qty * (entry_px - r1)
+                        realized_fees += tp_qty * r1 * maker_fee
                         rem_qty -= tp_qty
-                        current_sl = min(current_sl, entry_px)
-                        if m_high >= current_sl:
-                            exit_px = max(current_sl, l_high)
-                            gross_pnl += rem_qty * (entry_px - exit_px)
-                            fees_paid += rem_qty * exit_px * taker_fee
+                        new_sl = min(current_sl, entry_px)
+                        if m_high >= new_sl:
+                            experienced_be_trailing_ambiguity = True
+                            be_trailing_ambiguities += 1
+                            exit_px = max(new_sl, l_high) if slippage == 'stress_worst_candle' else new_sl
+                            realized_gross += rem_qty * (entry_px - exit_px)
+                            realized_fees += rem_qty * exit_px * taker_fee
+                            rem_qty = 0.0
                             closed = True
                             close_reason = 'TP1_THEN_BE_SAME_BAR'
                             close_ts = ts
                             break
+                        current_sl = new_sl
                 else:
                     if last_hits_tp1:
                         tp1_hit = True
                         tp_qty = round(entry_qty * 0.5, 0 if sym == 'CHIPUSDT' else 1)
-                        gross_pnl += tp_qty * (entry_px - r1)
-                        fees_paid += tp_qty * r1 * maker_fee
+                        realized_gross += tp_qty * (entry_px - r1)
+                        realized_fees += tp_qty * r1 * maker_fee
                         rem_qty -= tp_qty
-                        current_sl = min(current_sl, entry_px)
+                        new_sl = min(current_sl, entry_px)
+                        if m_high >= new_sl:
+                            experienced_be_trailing_ambiguity = True
+                            be_trailing_ambiguities += 1
+                        current_sl = new_sl
                     elif mark_hits_sl:
-                        exit_px = max(current_sl, l_high)
-                        gross_pnl += rem_qty * (entry_px - exit_px)
-                        fees_paid += rem_qty * exit_px * taker_fee
+                        exit_px = max(current_sl, l_high) if slippage == 'stress_worst_candle' else current_sl
+                        realized_gross += rem_qty * (entry_px - exit_px)
+                        realized_fees += rem_qty * exit_px * taker_fee
+                        rem_qty = 0.0
                         closed = True
                         close_reason = 'SL_TRIGGERED'
                         close_ts = ts
@@ -240,54 +273,71 @@ def run_replay(mode="pessimistic", with_4h_timeout=False, taker_fee=0.00055, mak
                         cand_sl_q = min(cands)
                     current_sl = min(current_sl, cand_sl_q)
 
-        if not closed:
-            final_bar = last_dict[common_ts[-1]]
-            final_px = float(final_bar[4])
-            gross_pnl += rem_qty * ((final_px - entry_px) if side == 'LONG' else (entry_px - final_px))
-            fees_paid += rem_qty * final_px * taker_fee
-            close_reason = 'OPEN_AT_END'
-            close_ts = common_ts[-1]
+        # Realized vs Unrealized separation
+        realized_net = realized_gross - realized_fees
+        unrealized_gross = 0.0
+        unrealized_net = 0.0
 
-        net_pnl = gross_pnl - fees_paid
+        if not closed and rem_qty > 0:
+            final_bar = last_dict[common_ts[-1]]
+            final_px = float(final_bar[4])  # 13:00:00 UTC cutoff price
+            unrealized_gross = rem_qty * ((final_px - entry_px) if side == 'LONG' else (entry_px - final_px))
+            unrealized_net = unrealized_gross - (rem_qty * final_px * taker_fee)
+            close_reason = 'OPEN_AT_END'
+
         results[pid] = {
             'parent_id': pid,
             'symbol': sym,
             'side': side,
             'entry_price': entry_px,
             'qty': entry_qty,
+            'rem_qty': rem_qty,
             'status': 'CLOSED' if closed else 'OPEN_AT_END',
             'close_reason': close_reason,
             'tp1_hit': tp1_hit,
-            'gross_pnl': gross_pnl,
-            'fees_paid': fees_paid,
-            'net_pnl': net_pnl,
+            'realized_gross': realized_gross,
+            'realized_fees': realized_fees,
+            'realized_net': realized_net,
+            'unrealized_gross': unrealized_gross,
+            'unrealized_net': unrealized_net,
+            'total_net': realized_net + unrealized_net,
             'bars_held': bars_held,
-            'experienced_ambiguity': experienced_ambiguity,
+            'ambiguity_tp1_sl': experienced_tp1_sl_ambiguity,
+            'ambiguity_be_trailing': experienced_be_trailing_ambiguity,
             'final_sl': current_sl
         }
 
-    return results, ambiguity_count
+    return results, tp1_sl_ambiguities, be_trailing_ambiguities
 
 if __name__ == "__main__":
     args = parse_args()
-    results, ambiguities = run_replay(
+    results, tp_sl_amb, be_amb = run_replay(
         mode=args.mode,
+        slippage=args.slippage,
         with_4h_timeout=args.with_4h_timeout,
         taker_fee=args.taker_fee,
         maker_fee=args.maker_fee
     )
-    tot_gross = sum(r['gross_pnl'] for r in results.values())
-    tot_fees = sum(r['fees_paid'] for r in results.values())
-    tot_net = sum(r['net_pnl'] for r in results.values())
-    tp1_count = sum(1 for r in results.values() if r['tp1_hit'])
+    tot_realized_gross = sum(r['realized_gross'] for r in results.values())
+    tot_realized_fees  = sum(r['realized_fees'] for r in results.values())
+    tot_realized_net   = sum(r['realized_net'] for r in results.values())
+    tot_unrealized_net = sum(r['unrealized_net'] for r in results.values())
+    tot_net            = sum(r['total_net'] for r in results.values())
+    tp1_count          = sum(1 for r in results.values() if r['tp1_hit'])
+    open_count         = sum(1 for r in results.values() if r['status'] == 'OPEN_AT_END')
 
-    print(f"--- REPLAY RUN [{args.mode.upper()}] (4h Timeout: {args.with_4h_timeout}) ---")
-    print(f"Total Parents Replayed:   {len(results)}")
-    print(f"TP1 Achieved:             {tp1_count} / {len(results)}")
-    print(f"Gross PnL:                {tot_gross:+9.4f} USDT")
-    print(f"Total Fees Paid:          {tot_fees:9.4f} USDT")
-    print(f"Net Realized PnL:         {tot_net:+9.4f} USDT")
-    print(f"Intra-bar Ambiguities:    {ambiguities} trades")
+    print(f"--- REPLAY RUN [{args.mode.upper()} | Slippage: {args.slippage.upper()} | 4h Timeout: {args.with_4h_timeout}] ---")
+    print(f"Total Parents Replayed:      {len(results)}")
+    print(f"TP1 Achieved:                {tp1_count} / {len(results)}")
+    print(f"Positions Closed:            {len(results) - open_count} / {len(results)}")
+    print(f"Positions Open at Cutoff:    {open_count} / {len(results)}")
+    print(f"Realized Gross PnL:          {tot_realized_gross:+9.4f} USDT")
+    print(f"Realized Fees Paid:          {tot_realized_fees:9.4f} USDT")
+    print(f"Realized Net PnL:            {tot_realized_net:+9.4f} USDT")
+    print(f"Unrealized Net PnL (Open):   {tot_unrealized_net:+9.4f} USDT")
+    print(f"Total Net PnL (Combined):    {tot_net:+9.4f} USDT")
+    print(f"Intra-bar TP1/SL Ambiguity:  {tp_sl_amb} trades")
+    print(f"Intra-bar BE Ambiguity:      {be_amb} trades")
 
     if args.output_csv:
         with open(args.output_csv, 'w', newline='', encoding='utf-8') as f:
