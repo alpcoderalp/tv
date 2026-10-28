@@ -1,0 +1,31 @@
+{
+  "manifest_version": "1.0",
+  "generation_time_utc": "2026-10-28 14:08:59 UTC",
+  "analysis_cohort": {
+    "start_cutoff_utc": "2026-10-23 09:31:39 UTC",
+    "start_cutoff_timestamp_ms": 1792747899000,
+    "end_cutoff_utc": "2026-10-28 13:00:00 UTC",
+    "cohort_parent_count": 113,
+    "cohort_closed_pnl_record_count": 173,
+    "cohort_net_realized_pnl_usdt": 8.994129,
+    "raw_bybit_api_closed_pnl_count": 176,
+    "raw_bybit_api_closed_pnl_sum_usdt": 12.132616,
+    "pre_cutoff_closures_count": 3,
+    "pre_cutoff_closures_pnl_usdt": 3.138487
+  },
+  "data_files_sha256": {
+    "scratch/recent_closed_pnl.json": "e4745b86e5d77a280909fef3c790a751107500a019fe9b0fd284c701e12dfac0",
+    "scratch/recent_orders.json": "b268e96e78d642d7da5d9593e6d72fd88e0b38ea0dad50ba6a17804a7d2b644b",
+    "scratch/recent_executions.json": "64751b1ad6a55c4ca4510ad66515c2b1777cc20c0c20ac6dd1acfa8b50c90882",
+    "scratch/klines/PONSUSDT_last_1m.json": "2939b9d0ef330497fbe92c4d984edff0587117dd95925ceaf21e740074aa10b9",
+    "scratch/klines/CHIPUSDT_last_1m.json": "d1a38662292535eeb5ec222ef4a25dce4e14f223590a5c498bf6f1b9b73e71d1",
+    "strategy_version_51F6CDD4.py": "51f6cdd4c38b680a33273aabdd974120a318a9f6e340504024f4b8d02819f637"
+  },
+  "replay_summary": {
+    "actual_allocated_pnl_usdt": 8.994129,
+    "replay_pessimistic_pnl_usdt": 16.5936,
+    "replay_optimistic_pnl_usdt": 16.5936,
+    "delta_pessimistic_usdt": 7.5997,
+    "delta_optimistic_usdt": 7.5997
+  }
+}
