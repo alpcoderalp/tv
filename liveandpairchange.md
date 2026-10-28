@@ -204,3 +204,4 @@ Yeni bir pair eklendiğinde TradingView tarafında alert oluştururken:
      🌊 [BYBIT PUBLIC WS] bağlandı: 4 ticker (wss://stream.bybit.com/v5/public/linear)
      ```
    Tüm yeni pair'ler için order book ve public WS ticker bağlantısının başarıyla kurulduğu teyit edilmelidir.
+

@@ -193,3 +193,4 @@ Herhangi bir beklenmeyen durumda `legacy` moduna geri dönmek için:
 3. `/home/ubuntu/deploy/.env.hummingbot` içinde `POSITION_MANAGEMENT_MODE=legacy` ve `RR2_PLACE_ENTRY_TP=1` yapın.
 4. `ssh -p 22022 ubuntu@57.129.5.114 "sudo rm -f /home/ubuntu/deploy/bots/data/tv_signal_state.json"`
 5. `ssh -p 22022 ubuntu@57.129.5.114 "cd /home/ubuntu/deploy && docker compose up -d --force-recreate hummingbot && docker start rogerthat"`
+
