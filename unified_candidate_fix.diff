@@ -1,0 +1,710 @@
+diff --git a/strategy_version_51F6CDD4.py b/tv_signal_strategy.py
+index a27a53b..4b8f2e2 100644
+--- a/strategy_version_51F6CDD4.py
++++ b/tv_signal_strategy.py
+@@ -2692,6 +2692,65 @@ class TVSignalStrategy(ScriptStrategyBase):
+                     "created",
+                     "partiallyfilled",
+                 ):
++                    # 🛡️ GEVŞETMEME KORUMASI: Daha iyi mevcut fiyat ve yanlış miktar durumunu ayır.
++                    # Daha iyi stopu düşüren amend gönderilmemeli.
++                    live_trig_raw = live.get("triggerPrice") or live.get("stopPrice")
++                    live_qty_raw = live.get("qty")
++                    try:
++                        live_trig = Decimal(str(live_trig_raw or 0))
++                    except Exception:
++                        live_trig = Decimal("0")
++                    try:
++                        live_q = Decimal(str(live_qty_raw or 0))
++                    except Exception:
++                        live_q = Decimal("0")
++
++                    is_better_price = False
++                    if live_trig > Decimal("0") and kind == "SL":
++                        if ps == "LONG" and live_trig > trig_q:
++                            is_better_price = True
++                        elif ps == "SHORT" and live_trig < trig_q:
++                            is_better_price = True
++
++                    if is_better_price:
++                        if live_q == qty_q:
++                            # Fiyat daha iyi ve miktar doğru: daha iyi stopu düşüren amend gönderilmez!
++                            out["success"] = True
++                            out["status"] = "preserved_better_sl"
++                            out["order_id"] = live.get("orderId") or cid
++                            out["not_modified"] = True
++                            self.logger().info(
++                                f"🛡️ [BYBIT COND {kind}] {trading_pair} {ps} mevcut stop ({live_trig}) "
++                                f"istenen hedeften ({trig_q}) daha iyi; stop düşürülmedi, korundu."
++                            )
++                            return out
++                        else:
++                            # Fiyat daha iyi ama miktar yanlış:
++                            # Stop fiyatını gevşetmeden (live_trig ile) miktar güvenli biçimde düzeltilir
++                            self.logger().info(
++                                f"🔧 [BYBIT COND {kind}] {trading_pair} {ps} daha iyi stop ({live_trig}) "
++                                f"korunarak miktar düzeltiliyor ({live_q} → {qty_q})"
++                            )
++                            am = await self._amend_bybit_conditional_order(
++                                connector, trading_pair, live_trig, order_link_id=cid, qty=qty_q
++                            )
++                            if am.get("success"):
++                                out["success"] = True
++                                out["status"] = "amended_qty_only"
++                                out["order_id"] = live.get("orderId") or cid
++                                return out
++                            else:
++                                # Stop fiyatını gevşetmeden miktar güvenli biçimde düzeltilemiyorsa
++                                # state'i başarıya ilerletme ve genel cancel/replace yapma!
++                                out["success"] = False
++                                out["status"] = "failed"
++                                out["error"] = f"safe_qty_amend_failed: {am.get('error')}"
++                                self.logger().warning(
++                                    f"⚠️ [BYBIT COND {kind}] {trading_pair} {ps} daha iyi stop ({live_trig}) "
++                                    f"gevşetilmeden miktar düzeltilemedi ({am.get('error')}); cancel/replace yapılmıyor."
++                                )
++                                return out
++
+                     am = await self._amend_bybit_conditional_order(
+                         connector, trading_pair, trig_q, order_link_id=cid, qty=qty_q
+                     )
+@@ -2710,15 +2769,344 @@ class TVSignalStrategy(ScriptStrategyBase):
+                     )
+                     return out
+ 
+-                # (b) CID yanmış → generation artırıp yeniden create et.
+-                # BİRDEN FAZLA generation yanmış olabilir (özellikle restart sonrası
+-                # generation defteri sıfırlandığında: gen0, gen1, gen2 hepsi yanmış).
+-                # Bu yüzden birkaç kez rotate deneriz; aksi halde parça 5 dakikalık
+-                # döngülerde ancak generation başına bir adım ilerler.
+                 try:
+                     burned_parent = (self._parse_cid(cid) or {}).get("parent_id")
+                 except Exception:
+                     burned_parent = None
++
++                # (b) Eski emir borsada DOLMUŞ (Filled) mu?
++                # KESİN KANIT ZİNCİRİ:
++                # 1) orderStatus açıkça "filled" olmalıdır.
++                # 2) burned_parent kimliği tracked parçayla eşleşmelidir.
++                # 3) cumExecQty veya /v5/execution/list kayıtlarıyla dolum miktarı kesin olarak doğrulanmalıdır.
++                # 4) Idempotent Dolum Muhasebesi: pos_match['applied_cumulative_fill'] kalıcı defteri kullanılır.
++                #    Yalnızca doğrulanmış yeni dolum farkı (new_delta = cum_exec - prev_applied) kalan miktardan düşülür.
++                #    WS ve REST aynı dolumu asla iki kez uygulamaz. State save hatası olursa sessiz başarı verilmez.
++                # 5) Kısmi dolum / residual (new_rem > 0):
++                #    - Kalan miktar için (new_rem) aktif bir stopun varlığı borsa emirlerinden sorgulanır.
++                #    - Parent kimliği VE residual miktarı birlikte doğrulanır; fiyat, SL türü, aktif durum
++                #      ve doğru pozisyon bacağı kontrol edilir. Eksik/boş/unknown statü/yön/positionIdx asla koruma sayılmaz.
++                #    - Sibling stopu ASLA koruma sayılmaz.
++                #    - Kapsayan aktif stop varsa 'partial_fill_covered' döner; aktif stop yoksa durum
++                #      açıkça 'unprotected_residual' olarak işaretlenir.
++                # 6) Tam dolum (new_rem == 0):
++                #    - Taze ve başarılı borsa snapshot'ı (ensure_fresh=True) ZORUNLUDUR.
++                #    - real_pos_amt eksik/stale ise parent SİLİNMEZ ('missing_snapshot_preserved').
++                #    - Borsa miktarı sibling toplamıyla enstrüman hassasiyetinde (%5 tolerans OLMADAN)
++                #      birebir uyuşmalıdır. Uyuşmazlıkta parent silinmez ('aggregate_mismatch_preserved').
++                #    - State save başarısız olursa sessiz başarı dönülmez ('state_save_failed').
++                # 7) Sıfır borsa pozisyonunda asla yeni generation yetim stop üretilmez.
++                if live and live_status == "filled":
++                    pos_match = None
++                    if burned_parent:
++                        for _p in (self._tracked_positions.get(trading_pair, {}) or {}).get(ps, []) or []:
++                            if str(_p.get("order_id")) == str(burned_parent):
++                                pos_match = _p
++                                break
++
++                    if not pos_match:
++                        self.logger().warning(
++                            f"🛑 [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
++                            f"eski {kind} emri ({cid}) borsada Filled ancak parent tracking'de yok. "
++                            f"Yeni stop konulmuyor."
++                        )
++                        out["success"] = True
++                        out["status"] = "already_filled_terminal"
++                        out["order_id"] = live.get("orderId") or cid
++                        out["not_modified"] = True
++                        return out
++
++                    # Gerçek dolum miktarını cumExecQty'den çek (qty veya pos.amount fallback'i KULLANILMAZ!)
++                    try:
++                        cum_exec_raw = live.get("cumExecQty")
++                        cum_exec = Decimal(str(cum_exec_raw)) if (cum_exec_raw is not None and str(cum_exec_raw).strip() != "") else None
++                    except Exception:
++                        cum_exec = None
++
++                    # cumExecQty eksik/geçersizse execution endpoint'inden Trade bazlı doğrula
++                    if cum_exec is None or cum_exec <= Decimal("0"):
++                        try:
++                            ex_res = await self._bybit_raw_get(
++                                connector,
++                                f"/v5/execution/list?category=linear&symbol={trading_pair}&orderId={live.get('orderId') or cid}"
++                            )
++                            ex_list = (ex_res or {}).get("result", {}).get("list", []) or []
++                            expected_close_side = "Sell" if ps == "LONG" else "Buy"
++                            target_order_id = str(live.get("orderId") or "")
++                            target_cid = str(cid or "")
++
++                            seen_execs = set()
++                            sum_exec = Decimal("0")
++                            for ex in ex_list:
++                                if str(ex.get("execType") or "").lower() != "trade":
++                                    continue
++                                if str(ex.get("side") or "").capitalize() != expected_close_side:
++                                    continue
++                                ex_oid = str(ex.get("orderId") or "")
++                                ex_cid = str(ex.get("orderLinkId") or "")
++                                if target_order_id and ex_oid != target_order_id and ex_cid != target_cid:
++                                    continue
++                                eid = ex.get("execId")
++                                if eid and eid not in seen_execs:
++                                    seen_execs.add(eid)
++                                    sum_exec += Decimal(str(ex.get("execQty") or 0))
++                            if sum_exec > Decimal("0"):
++                                cum_exec = sum_exec
++                        except Exception as _ex_err:
++                            self.logger().debug(f"[EXEC LIST LOOKUP] {_ex_err}")
++
++                    # Eğer fill miktarı hala doğrulanamıyorsa: BELİRSİZ!
++                    if cum_exec is None or cum_exec <= Decimal("0"):
++                        self.logger().warning(
++                            f"⚠️ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
++                            f"emir ({cid}) Filled görünüyor ancak execType=Trade ile doğrulanmış cumExecQty bulunamadı. "
++                            f"qty/amount varsayımı KULLANILMIYOR; parent silinmeden salt-okunur reconcile bekleniyor."
++                        )
++                        out["success"] = False
++                        out["status"] = "ambiguous_fill_preserved"
++                        out["order_id"] = live.get("orderId") or cid
++                        out["not_modified"] = True
++                        return out
++
++                    parent_remaining = Decimal(str(pos_match.get("remaining_amount", pos_match.get("amount", 0)) or 0))
++                    applied_fills = pos_match.setdefault("applied_cumulative_fill", {})
++                    fill_key = str(live.get("orderId") or cid)
++                    prev_applied = Decimal(str(applied_fills.get(fill_key, "0")))
++
++                    # Idempotent Muhasebe: Yalnızca yeni dolum farkı hesaplanır
++                    new_delta = max(Decimal("0"), cum_exec - prev_applied)
++
++                    # Durum: Fazla Dolum (Over-Fill: new_delta > parent_remaining)
++                    if new_delta > parent_remaining:
++                        self.logger().warning(
++                            f"⚠️ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
++                            f"yeni stop dolumu farkı ({new_delta}) parent kalanından ({parent_remaining}) büyük! "
++                            f"Sibling etkisi belirsiz; parent tracking'den silinmiyor."
++                        )
++                        out["success"] = False
++                        out["status"] = "overfill_ambiguous_preserved"
++                        out["order_id"] = live.get("orderId") or cid
++                        out["not_modified"] = True
++                        return out
++
++                    if new_delta > Decimal("0"):
++                        new_rem = max(Decimal("0"), parent_remaining - new_delta)
++                        pos_match["remaining_amount"] = float(new_rem)
++                        applied_fills[fill_key] = str(cum_exec)
++                        save_ok = self._save_state()
++                        if not save_ok:
++                            self.logger().error(
++                                f"❌ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
++                                f"state kaydetme başarısız! Belirsiz durum korunuyor, sessiz başarı verilmiyor."
++                            )
++                            out["success"] = False
++                            out["status"] = "state_save_failed"
++                            out["error"] = "state_save_failed"
++                            return out
++                    else:
++                        new_rem = parent_remaining
++
++                    # Durum 1: Kısmi Dolum / Residual Kalan (new_rem > 0)
++                    if new_rem > Decimal("0"):
++                        # Kalan miktar için aktif stop varlığını borsa emirlerinden denetle
++                        residual_covered = False
++                        try:
++                            active_conds = await self._get_bybit_conditional_orders(connector, trading_pair, ps)
++                            expected_pidx = self._bybit_position_idx(connector, ps, is_open=True)
++                            expected_close_side = "SELL" if ps == "LONG" else "BUY"
++                            parent_sl = Decimal(str(pos_match.get("sl") or 0))
++                            ACTIVE_STATUS_ALLOWLIST = {"untriggered", "new", "active"}
++
++                            for c in (active_conds or []):
++                                # 1. SL türü kontrolü
++                                if c.get("kind") != "SL":
++                                    continue
++
++                                # 2. Parent kimliği kontrolü (Sibling stopunu ASLA residual koruması sayma!)
++                                c_pid = c.get("parent_id")
++                                if c_pid is None or str(c_pid) != str(burned_parent):
++                                    continue
++
++                                # 3. Residual miktarı kontrolü (enstrüman miktar hassasiyetine göre tam eşitlik)
++                                c_qty = Decimal(str(c.get("qty") or 0))
++                                q_c_qty = connector.quantize_order_amount(trading_pair, c_qty)
++                                q_new_rem = connector.quantize_order_amount(trading_pair, new_rem)
++                                if q_c_qty != q_new_rem or q_c_qty < q_new_rem:
++                                    continue
++
++                                # 4. Fiyat kontrolü (SL trigger fiyatı geçerli ve parent SL seviyesini karşılıyor mu?)
++                                c_trig = Decimal(str(c.get("triggerPrice") or c.get("price") or 0))
++                                if c_trig <= Decimal("0"):
++                                    continue
++                                if parent_sl > Decimal("0"):
++                                    if ps == "LONG" and c_trig < parent_sl:
++                                        continue
++                                    if ps == "SHORT" and c_trig > parent_sl:
++                                        continue
++
++                                # 5. Aktif durum kontrolü (AÇIK İZİN LİSTESİ - Eksik/boş/unknown reddedilir)
++                                raw_status = c.get("orderStatus")
++                                if raw_status is None:
++                                    continue
++                                c_status = str(raw_status).strip().lower()
++                                if not c_status or c_status == "unknown" or c_status not in ACTIVE_STATUS_ALLOWLIST:
++                                    continue
++
++                                # 6. Doğru pozisyon bacağı kontrolü (positionIdx ve side - Eksik/boş/hatalı reddedilir)
++                                raw_side = c.get("side")
++                                if raw_side is None:
++                                    continue
++                                c_side = str(raw_side).strip().upper()
++                                if not c_side or c_side != expected_close_side:
++                                    continue
++
++                                c_pidx = c.get("positionIdx")
++                                if c_pidx is None:
++                                    continue
++                                try:
++                                    c_pidx_int = int(c_pidx)
++                                except (ValueError, TypeError):
++                                    continue
++                                if c_pidx_int not in (1, 2) or c_pidx_int != expected_pidx:
++                                    continue
++
++                                # Tüm 6 kriter eksiksiz sağlandı:
++                                residual_covered = True
++                                break
++                        except Exception as _ce:
++                            self.logger().debug(f"[RESIDUAL STOP CHECK] {_ce}")
++
++                        if residual_covered:
++                            self.logger().info(
++                                f"🛡️ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
++                                f"kısmi stop dolumu sonrası kalan {new_rem} aktif stopla korunuyor."
++                            )
++                            out["success"] = True
++                            out["status"] = "partial_fill_covered"
++                            out["remaining_amount"] = str(new_rem)
++                            out["order_id"] = live.get("orderId") or cid
++                            out["not_modified"] = True
++                            return out
++                        else:
++                            self.logger().warning(
++                                f"🔓 [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
++                                f"kısmi stop dolumu sonrası kalan {new_rem} için aktif stop YOK! "
++                                f"Korumasız/belirsiz durum işaretlendi."
++                            )
++                            out["success"] = False
++                            out["status"] = "unprotected_residual"
++                            out["error"] = f"unprotected_residual_{new_rem}"
++                            out["remaining_amount"] = str(new_rem)
++                            out["order_id"] = live.get("orderId") or cid
++                            out["not_modified"] = False
++                            return out
++
++                    # Durum 3: Tam Dolum (new_rem == 0)
++                    # TAZE ve BAŞARILI borsa pozisyon snapshot'ı (ensure_fresh=True) ZORUNLUDUR!
++                    try:
++                        real_pos_amt = await self._get_cached_position_amount(
++                            trading_pair, ps, ensure_fresh=True, reason="terminal_verify_snapshot"
++                        )
++                    except Exception:
++                        real_pos_amt = None
++
++                    if real_pos_amt is None or Decimal(str(real_pos_amt)) < Decimal("0"):
++                        self.logger().warning(
++                            f"⚠️ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
++                            f"stop tam doldu ancak taze borsa snapshot'ı alınamadı/doğrulanamadı; parent silinmiyor."
++                        )
++                        out["success"] = False
++                        out["status"] = "missing_snapshot_preserved"
++                        out["error"] = "fresh_exchange_snapshot_unverified"
++                        out["order_id"] = live.get("orderId") or cid
++                        out["not_modified"] = True
++                        return out
++
++                    other_parents = [
++                        p for p in (self._tracked_positions.get(trading_pair, {}) or {}).get(ps, []) or []
++                        if str(p.get("order_id")) != str(burned_parent)
++                    ]
++                    expected_remaining_exchange = sum(
++                        Decimal(str(p.get("remaining_amount", p.get("amount", 0)) or 0))
++                        for p in other_parents
++                    )
++
++                    q_real = connector.quantize_order_amount(trading_pair, Decimal(str(real_pos_amt)))
++                    q_expected = connector.quantize_order_amount(trading_pair, expected_remaining_exchange)
++
++                    # Borsa miktarı sibling toplamıyla birebir (quantize hassasiyetinde) uyuşmalıdır.
++                    # %5 tolerans KALDIRILMIŞTIR: en ufak gerçek farkta bile terminal cleanup engellenir.
++                    if q_real != q_expected:
++                        self.logger().warning(
++                            f"⚠️ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
++                            f"stop tam doldu ancak borsa pozisyonu ({q_real}) "
++                            f"kalan sibling toplamıyla ({q_expected}) tam uyuşmuyor (fark={abs(q_real - q_expected)}). "
++                            f"Sıfır tolerans mutabakatı gereği parent silinmiyor, belirsiz state korunuyor."
++                        )
++                        out["success"] = False
++                        out["status"] = "aggregate_mismatch_preserved"
++                        out["order_id"] = live.get("orderId") or cid
++                        out["not_modified"] = True
++                        return out
++
++                    # Bütün kanıt zinciri TAM:
++                    fill_px = Decimal(str(live.get("avgPrice") or live.get("price") or pos_match.get("sl") or 0))
++                    try:
++                        self._archive_trigger_close(
++                            trading_pair,
++                            ps,
++                            pos_match,
++                            burned_parent,
++                            kind,
++                            {
++                                "orderId": live.get("orderId") or cid,
++                                "qty": str(cum_exec),
++                                "price": str(fill_px),
++                                "time": int(live.get("updatedTime") or time.time() * 1000),
++                            },
++                        )
++                    except Exception as _ae:
++                        self.logger().debug(f"[REST FILLED archive] {_ae}")
++
++                    self._cleanup_position_tracking(trading_pair, ps, burned_parent)
++                    save_ok = self._save_state()
++                    if not save_ok:
++                        self.logger().error(
++                            f"❌ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
++                            f"terminal cleanup sonrası state kaydetme başarısız!"
++                        )
++                        out["success"] = False
++                        out["status"] = "state_save_failed"
++                        out["error"] = "terminal_state_save_failed"
++                        return out
++
++                    self.logger().info(
++                        f"🛑 [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
++                        f"tam dolum kanıtlandı (qty={cum_exec} @ {fill_px}); parent güvenle kapatıldı."
++                    )
++                    out["success"] = True
++                    out["status"] = "already_filled_terminal"
++                    out["order_id"] = live.get("orderId") or cid
++                    out["not_modified"] = True
++                    return out
++
++                # (c) CID yanmış (Cancelled/Deactivated/vb.) → generation artırıp yeniden create et.
++                # ANCAK borsa pozisyonu 0 ise yeni generation stop koyulmaz!
++                try:
++                    real_pos_amt = await self._get_cached_position_amount(
++                        trading_pair, ps, ensure_fresh=False, reason="cid_burned_check"
++                    )
++                    if real_pos_amt is not None and Decimal(str(real_pos_amt)) <= Decimal("0"):
++                        self.logger().warning(
++                            f"🛑 [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
++                            f"CID yanmış ({cid}, status={live_status}) ancak borsa pozisyonu sıfır! "
++                            f"Yetim stop üretilmiyor."
++                        )
++                        out["error"] = "zero_position_no_stop"
++                        return out
++                except Exception:
++                    pass
++
+                 prev_cid = cid
+                 for _rot in range(self.BYBIT_CID_ROTATE_TRIES):
+                     new_cid = self._bybit_bump_cid_generation(burned_parent, kind)
+@@ -3296,6 +3684,7 @@ class TVSignalStrategy(ScriptStrategyBase):
+                         "qty": q,
+                         "positionIdx": pidx,
+                         "side": (o.get("side") or "").upper(),
++                        "orderStatus": o.get("orderStatus"),
+                         # v4.0: koşullu leg → 10'luk kotayı TÜKETİR
+                         "is_limit": False,
+                         "consumes_cond_slot": True,
+@@ -9190,22 +9579,19 @@ class TVSignalStrategy(ScriptStrategyBase):
+                 self.logger().debug(f"[SL COVERAGE] periodic: {_cg}")
+ 
+             def _has_leg(orders, pid_, piece_qty):
+-                if not orders:
++                if not orders or not pid_:
+                     return False
+-                # 1) CID (parent_id) ile KESİN eşleşme
+-                if pid_:
+-                    for o in orders:
+-                        if o.get("parent_id") == pid_:
+-                            return True
+-                # 2) qty (±%5) ile yaklaşık eşleşme (CID yoksa)
+-                if piece_qty is None or piece_qty <= 0:
+-                    return True
++                q_piece = connector.quantize_order_amount(trading_pair, piece_qty) if piece_qty and piece_qty > 0 else None
+                 for o in orders:
+-                    oq = o.get("qty", Decimal("0"))
+-                    if oq <= 0:
+-                        return True
+-                    if abs(oq - piece_qty) <= (piece_qty * Decimal("0.05")):
+-                        return True
++                    # Parent kimliği KESİNLİKLE eşleşmeli (Sibling stopu koruma sayılamaz)
++                    if str(o.get("parent_id")) != str(pid_):
++                        continue
++                    # Miktar kontrolü: parça miktarı biliniyorsa tam quantize eşitliği zorunludur
++                    if q_piece is not None:
++                        oq = connector.quantize_order_amount(trading_pair, Decimal(str(o.get("qty", 0) or 0)))
++                        if oq != q_piece:
++                            continue
++                    return True
+                 return False
+ 
+             for pos in list(positions):
+@@ -9300,9 +9686,17 @@ class TVSignalStrategy(ScriptStrategyBase):
+ 
+                 # Konulamayan leg'leri AÇIKÇA raporla (sessiz naked parça olmasın)
+                 unplaced = []
+-                if need_sl and not sl_ok:
++                sl_safe = r.get("sl_status") in (
++                    "already_filled_terminal",
++                    "partial_fill_covered",
++                )
++                tp_safe = r.get("tp_status") in (
++                    "already_filled_terminal",
++                    "partial_fill_covered",
++                )
++                if need_sl and not sl_ok and not sl_safe:
+                     unplaced.append(f"SL({r.get('sl_status') or r.get('error')})")
+-                if need_tp and not tp_ok:
++                if need_tp and not tp_ok and not tp_safe:
+                     unplaced.append(f"TP({r.get('tp_status') or r.get('error')})")
+                 if unplaced:
+                     self.logger().warning(
+@@ -17166,11 +17560,6 @@ class TVSignalStrategy(ScriptStrategyBase):
+         zararsızdır (ikinci iptal "not exist" → başarı sayılır).
+         """
+         try:
+-            try:
+-                fill_qty = Decimal(str(ex.get("execQty") or ex.get("closedSize") or 0))
+-            except Exception:
+-                fill_qty = Decimal("0")
+-
+             # parçayı bul
+             pieces = list(
+                 (self._tracked_positions.get(trading_pair, {}) or {}).get(side, [])
+@@ -17178,22 +17567,64 @@ class TVSignalStrategy(ScriptStrategyBase):
+             piece = next(
+                 (p for p in pieces if p.get("order_id") == parent_id), None
+             )
+-            piece_rem = Decimal("0")
+-            if piece is not None:
+-                try:
+-                    piece_rem = Decimal(
+-                        str(piece.get("remaining_amount", piece.get("amount", 0)) or 0)
+-                    )
+-                except Exception:
+-                    piece_rem = Decimal("0")
++            if piece is None:
++                return
++
++            # 1. WS execId bazında tekilleştirme (aynı gerçekleşme asla iki kez düşülmez)
++            exec_id = str(ex.get("execId") or "").strip()
++            order_id = str(ex.get("orderId") or ex.get("orderLinkId") or "").strip()
++            applied_execs = piece.setdefault("applied_exec_ids", {})
++            applied_fills = piece.setdefault("applied_cumulative_fill", {})
++            order_ws_fills = piece.setdefault("ws_fills_by_order", {})
++
++            if exec_id and exec_id in applied_execs:
++                self.logger().debug(
++                    f"🔁 [WS LEG FILL] Duplicate execId={exec_id} already applied for #{parent_id}, skipping"
++                )
++                return
++
++            try:
++                raw_fill = Decimal(str(ex.get("execQty") or ex.get("closedSize") or 0))
++            except Exception:
++                raw_fill = Decimal("0")
++            fill_qty = connector.quantize_order_amount(trading_pair, raw_fill) if hasattr(connector, "quantize_order_amount") else raw_fill
++            if fill_qty <= Decimal("0"):
++                return
++
++            # 2. REST kümülatif dolumlarıyla mutabakat: Bu gerçekleşme daha önce REST tarafından düşüldü mü?
++            prev_cum_applied = Decimal(str(applied_fills.get(order_id, "0")))
++            prev_ws_for_order = Decimal(str(order_ws_fills.get(order_id, "0")))
++            new_ws_for_order = prev_ws_for_order + fill_qty
++
++            if new_ws_for_order <= prev_cum_applied:
++                # Bu gerçekleşme REST cumExecQty içinde zaten düşülmüştür; ek miktar düşülmez
++                new_delta = Decimal("0")
++            else:
++                new_delta = new_ws_for_order - max(prev_cum_applied, prev_ws_for_order)
++
++            if exec_id:
++                applied_execs[exec_id] = str(fill_qty)
++            order_ws_fills[order_id] = str(new_ws_for_order)
++            applied_fills[order_id] = str(max(prev_cum_applied, new_ws_for_order))
++
++            # 3. Doğrulanmış yeni dolum farkını kalan miktardan düş
++            piece_rem = Decimal(str(piece.get("remaining_amount", piece.get("amount", 0)) or 0))
++            if new_delta > Decimal("0"):
++                piece_rem = max(Decimal("0"), piece_rem - new_delta)
++                piece["remaining_amount"] = float(piece_rem)
++                save_ok = self._save_state()
++                if not save_ok:
++                    self.logger().error(f"❌ [WS LEG FILL] State save failed for #{parent_id}")
++                    return
++
++            # 4. full_close kararı KESİNLİKLE tekilleştirme ve yeni dolum hesabı yapıldıktan sonra verilir!
++            q_piece_rem = connector.quantize_order_amount(trading_pair, piece_rem) if hasattr(connector, "quantize_order_amount") else piece_rem
++            full_close = (q_piece_rem <= Decimal("0"))
+ 
+-            full_close = piece_rem <= 0 or (
+-                fill_qty > 0 and fill_qty >= piece_rem * Decimal("0.95")
+-            )
+             if not full_close:
+                 self.logger().info(
+                     f"📏 [WS LEG FILL] {trading_pair} {side} #{parent_id} {kind} "
+-                    f"KISMİ fill ({fill_qty}/{piece_rem}) → parça takipte kalıyor"
++                    f"KISMİ fill (delta={new_delta}, rem={piece_rem}) → parça takipte kalıyor"
+                 )
+                 return
+ 
+@@ -33996,23 +34427,72 @@ class TVSignalStrategy(ScriptStrategyBase):
+                         price_increase_pct = ((peak_price - entry_price) / entry_price) * 100
+                         expected_sl_level = int(price_increase_pct // Decimal("0.2"))
+                         cand_sl = entry_price * (1 + (expected_sl_level * Decimal("0.001")))
+-                        last_logged_sl = pos_data.get("last_logged_sl", entry_price)
+-                        if cand_sl > last_logged_sl + (entry_price * Decimal("0.0005")):
++                        current_sl = max(
++                            Decimal(str(pos_data.get("confirmed_sl") or 0)),
++                            Decimal(str(pos_data.get("sl") or 0)),
++                            Decimal(str(pos_data.get("last_logged_sl") or 0)),
++                            Decimal(str(entry_price or 0)),
++                        )
++                        if cand_sl > current_sl + (entry_price * Decimal("0.0005")):
+                             new_sl = cand_sl
+                     elif side == "SHORT":
+                         price_decrease_pct = ((entry_price - peak_price) / entry_price) * 100
+                         expected_sl_level = int(price_decrease_pct // Decimal("0.2"))
+                         cand_sl = entry_price * (1 - (expected_sl_level * Decimal("0.001")))
+-                        last_logged_sl = pos_data.get("last_logged_sl", entry_price)
+-                        if cand_sl < last_logged_sl - (entry_price * Decimal("0.0005")):
++                        cands = [
++                            Decimal(str(pos_data[k]))
++                            for k in ("confirmed_sl", "sl", "last_logged_sl", "entry")
++                            if pos_data.get(k) and Decimal(str(pos_data[k])) > 0
++                        ]
++                        current_sl = min(cands) if cands else entry_price
++                        if cand_sl < current_sl - (entry_price * Decimal("0.0005")):
+                             new_sl = cand_sl
+ 
+                     if new_sl is not None:
++                        # 🔧 FIX: Normal hibrit 2R çağrı noktasında tek operasyonel hedef üret.
++                        # Request ve doğrulayıcı aynı quantize edilmiş hedefi kullanır.
++                        # Quantize hatasında ham hedefle sessiz devam edilmez; stop/state korunup retry edilir.
++                        raw_target = new_sl
++                        quantize_fn = getattr(connector, "quantize_order_price", None)
++                        if not callable(quantize_fn):
++                            retry_ts[position_order_id] = now_ts
++                            self.logger().warning(
++                                f"⚠️ [HYBRID TRAIL 2R RETRY] {trading_pair} {side} #{position_order_id} "
++                                f"- connector quantize_order_price çağrılamıyor; stop/state korunup 3s sonra retry"
++                            )
++                            return
++
++                        try:
++                            q_target = quantize_fn(trading_pair, raw_target)
++                            if q_target is None:
++                                raise ValueError("quantize_order_price None döndürdü")
++                            operational_sl = Decimal(str(q_target))
++                            if (
++                                operational_sl <= Decimal("0")
++                                or operational_sl.is_nan()
++                                or operational_sl.is_infinite()
++                            ):
++                                raise ValueError(f"Geçersiz quantize edilmiş sl: {operational_sl}")
++                        except Exception as q_err:
++                            retry_ts[position_order_id] = now_ts
++                            self.logger().warning(
++                                f"⚠️ [HYBRID TRAIL 2R RETRY] {trading_pair} {side} #{position_order_id} "
++                                f"- quantize hatası: {q_err} (raw_target={raw_target}); "
++                                f"ham hedefle devam edilmiyor, stop/state korunup 3s sonra retry"
++                            )
++                            return
++
++                        # 🛡️ GEVŞETMEME KONTROLÜ: Operasyonel hedef mevcut en iyi stoptan daha iyi değilse gönderme
++                        if side == "LONG" and operational_sl <= current_sl:
++                            return
++                        if side == "SHORT" and operational_sl >= current_sl:
++                            return
++
+                         prev_logged = pos_data.get("last_logged_sl") or pos_data.get("sl")
+                         success = await self._update_trailing_sl_rr2_strict(
+                             exchange=exchange,
+                             trading_pair=trading_pair,
+-                            new_sl=new_sl,
++                            new_sl=operational_sl,
+                             side=side,
+                             position_order_id=position_order_id,
+                         )
+@@ -34027,7 +34507,7 @@ class TVSignalStrategy(ScriptStrategyBase):
+                                 trading_pair=trading_pair,
+                                 side=side,
+                                 position_order_id=position_order_id,
+-                                target_sl=new_sl,
++                                target_sl=operational_sl,
+                                 expected_qty=rem_amt,
+                             )
+ 
+@@ -34038,7 +34518,8 @@ class TVSignalStrategy(ScriptStrategyBase):
+                             pos_data["last_logged_sl"] = observed_sl
+                             self.logger().info(
+                                 f"{'🔺' if side == 'LONG' else '🔻'} [HYBRID 2R TRAIL] {trading_pair} {side} "
+-                                f"#{position_order_id} - Peak: {peak_price}, SL: {last_logged_sl} → {observed_sl}"
++                                f"#{position_order_id} - Peak: {peak_price}, SL: {last_logged_sl} → {observed_sl} "
++                                f"(raw_target={raw_target}, op_target={operational_sl}, observed={observed_sl})"
+                             )
+                         else:
+                             if prev_logged is not None:
+@@ -34046,7 +34527,8 @@ class TVSignalStrategy(ScriptStrategyBase):
+                             retry_ts[position_order_id] = now_ts
+                             self.logger().warning(
+                                 f"⚠️ [HYBRID TRAIL 2R RETRY] {trading_pair} {side} #{position_order_id} "
+-                                f"- new_sl={new_sl} borsada doğrulanamadı; state yazılmadı, 3s sonra retry"
++                                f"- op_target={operational_sl} (raw_target={raw_target}) borsada doğrulanamadı "
++                                f"(observed={observed_sl}); state yazılmadı, 3s sonra retry"
+                             )
+                     return
+ 
+@@ -36498,6 +36980,15 @@ class TVSignalStrategy(ScriptStrategyBase):
+                                 "accounted_exec_ids": list(
+                                     pos_data.get("accounted_exec_ids") or []
+                                 ),
++                                "applied_cumulative_fill": dict(
++                                    pos_data.get("applied_cumulative_fill") or {}
++                                ),
++                                "applied_exec_ids": dict(
++                                    pos_data.get("applied_exec_ids") or {}
++                                ),
++                                "ws_fills_by_order": dict(
++                                    pos_data.get("ws_fills_by_order") or {}
++                                ),
+                                 "peak_price": peak_val,
+                                 "initial_sl": initial_sl_val,
+                                 "phase2_first_sl": phase2_first_sl_val,
+@@ -37241,6 +37732,15 @@ class TVSignalStrategy(ScriptStrategyBase):
+                             "side": side,
+                             "risk": Decimal(str(saved_pos["risk"])),
+                             "1r_reached": saved_pos.get("1r_reached", False),
++                            "applied_cumulative_fill": dict(
++                                saved_pos.get("applied_cumulative_fill") or {}
++                            ),
++                            "applied_exec_ids": dict(
++                                saved_pos.get("applied_exec_ids") or {}
++                            ),
++                            "ws_fills_by_order": dict(
++                                saved_pos.get("ws_fills_by_order") or {}
++                            ),
+                             "phase2_active": saved_pos.get(
+                                 "phase2_active", False
+                             ),

@@ -820,6 +820,8 @@ class TVSignalStrategy(ScriptStrategyBase):
         self._last_rest_trade_fetch = {}
         self._binance_positions_cache = {}
         self._binance_positions_last_fetch = 0
+        self._positions_snapshot_verified = False
+        self._positions_snapshot_last_ts = 0.0
         self._periodic_verify_zero_pos_hits: Dict[Tuple[str, str, int], int] = {}
         self._last_ws_buffer_cleanup = 0  # ✅ FIX: WS buffer cleanup tracking
         self._last_ws_message_time = 0  # 🆕 WS bağlantı sağlığı için: son mesaj zamanı
@@ -2690,6 +2692,65 @@ class TVSignalStrategy(ScriptStrategyBase):
                     "created",
                     "partiallyfilled",
                 ):
+                    # 🛡️ GEVŞETMEME KORUMASI: Daha iyi mevcut fiyat ve yanlış miktar durumunu ayır.
+                    # Daha iyi stopu düşüren amend gönderilmemeli.
+                    live_trig_raw = live.get("triggerPrice") or live.get("stopPrice")
+                    live_qty_raw = live.get("qty")
+                    try:
+                        live_trig = Decimal(str(live_trig_raw or 0))
+                    except Exception:
+                        live_trig = Decimal("0")
+                    try:
+                        live_q = Decimal(str(live_qty_raw or 0))
+                    except Exception:
+                        live_q = Decimal("0")
+
+                    is_better_price = False
+                    if live_trig > Decimal("0") and kind == "SL":
+                        if ps == "LONG" and live_trig > trig_q:
+                            is_better_price = True
+                        elif ps == "SHORT" and live_trig < trig_q:
+                            is_better_price = True
+
+                    if is_better_price:
+                        if live_q == qty_q:
+                            # Fiyat daha iyi ve miktar doğru: daha iyi stopu düşüren amend gönderilmez!
+                            out["success"] = True
+                            out["status"] = "preserved_better_sl"
+                            out["order_id"] = live.get("orderId") or cid
+                            out["not_modified"] = True
+                            self.logger().info(
+                                f"🛡️ [BYBIT COND {kind}] {trading_pair} {ps} mevcut stop ({live_trig}) "
+                                f"istenen hedeften ({trig_q}) daha iyi; stop düşürülmedi, korundu."
+                            )
+                            return out
+                        else:
+                            # Fiyat daha iyi ama miktar yanlış:
+                            # Stop fiyatını gevşetmeden (live_trig ile) miktar güvenli biçimde düzeltilir
+                            self.logger().info(
+                                f"🔧 [BYBIT COND {kind}] {trading_pair} {ps} daha iyi stop ({live_trig}) "
+                                f"korunarak miktar düzeltiliyor ({live_q} → {qty_q})"
+                            )
+                            am = await self._amend_bybit_conditional_order(
+                                connector, trading_pair, live_trig, order_link_id=cid, qty=qty_q
+                            )
+                            if am.get("success"):
+                                out["success"] = True
+                                out["status"] = "amended_qty_only"
+                                out["order_id"] = live.get("orderId") or cid
+                                return out
+                            else:
+                                # Stop fiyatını gevşetmeden miktar güvenli biçimde düzeltilemiyorsa
+                                # state'i başarıya ilerletme ve genel cancel/replace yapma!
+                                out["success"] = False
+                                out["status"] = "failed"
+                                out["error"] = f"safe_qty_amend_failed: {am.get('error')}"
+                                self.logger().warning(
+                                    f"⚠️ [BYBIT COND {kind}] {trading_pair} {ps} daha iyi stop ({live_trig}) "
+                                    f"gevşetilmeden miktar düzeltilemedi ({am.get('error')}); cancel/replace yapılmıyor."
+                                )
+                                return out
+
                     am = await self._amend_bybit_conditional_order(
                         connector, trading_pair, trig_q, order_link_id=cid, qty=qty_q
                     )
@@ -2708,15 +2769,344 @@ class TVSignalStrategy(ScriptStrategyBase):
                     )
                     return out
 
-                # (b) CID yanmış → generation artırıp yeniden create et.
-                # BİRDEN FAZLA generation yanmış olabilir (özellikle restart sonrası
-                # generation defteri sıfırlandığında: gen0, gen1, gen2 hepsi yanmış).
-                # Bu yüzden birkaç kez rotate deneriz; aksi halde parça 5 dakikalık
-                # döngülerde ancak generation başına bir adım ilerler.
                 try:
                     burned_parent = (self._parse_cid(cid) or {}).get("parent_id")
                 except Exception:
                     burned_parent = None
+
+                # (b) Eski emir borsada DOLMUŞ (Filled) mu?
+                # KESİN KANIT ZİNCİRİ:
+                # 1) orderStatus açıkça "filled" olmalıdır.
+                # 2) burned_parent kimliği tracked parçayla eşleşmelidir.
+                # 3) cumExecQty veya /v5/execution/list kayıtlarıyla dolum miktarı kesin olarak doğrulanmalıdır.
+                # 4) Idempotent Dolum Muhasebesi: pos_match['applied_cumulative_fill'] kalıcı defteri kullanılır.
+                #    Yalnızca doğrulanmış yeni dolum farkı (new_delta = cum_exec - prev_applied) kalan miktardan düşülür.
+                #    WS ve REST aynı dolumu asla iki kez uygulamaz. State save hatası olursa sessiz başarı verilmez.
+                # 5) Kısmi dolum / residual (new_rem > 0):
+                #    - Kalan miktar için (new_rem) aktif bir stopun varlığı borsa emirlerinden sorgulanır.
+                #    - Parent kimliği VE residual miktarı birlikte doğrulanır; fiyat, SL türü, aktif durum
+                #      ve doğru pozisyon bacağı kontrol edilir. Eksik/boş/unknown statü/yön/positionIdx asla koruma sayılmaz.
+                #    - Sibling stopu ASLA koruma sayılmaz.
+                #    - Kapsayan aktif stop varsa 'partial_fill_covered' döner; aktif stop yoksa durum
+                #      açıkça 'unprotected_residual' olarak işaretlenir.
+                # 6) Tam dolum (new_rem == 0):
+                #    - Taze ve başarılı borsa snapshot'ı (ensure_fresh=True) ZORUNLUDUR.
+                #    - real_pos_amt eksik/stale ise parent SİLİNMEZ ('missing_snapshot_preserved').
+                #    - Borsa miktarı sibling toplamıyla enstrüman hassasiyetinde (%5 tolerans OLMADAN)
+                #      birebir uyuşmalıdır. Uyuşmazlıkta parent silinmez ('aggregate_mismatch_preserved').
+                #    - State save başarısız olursa sessiz başarı dönülmez ('state_save_failed').
+                # 7) Sıfır borsa pozisyonunda asla yeni generation yetim stop üretilmez.
+                if live and live_status == "filled":
+                    pos_match = None
+                    if burned_parent:
+                        for _p in (self._tracked_positions.get(trading_pair, {}) or {}).get(ps, []) or []:
+                            if str(_p.get("order_id")) == str(burned_parent):
+                                pos_match = _p
+                                break
+
+                    if not pos_match:
+                        self.logger().warning(
+                            f"🛑 [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
+                            f"eski {kind} emri ({cid}) borsada Filled ancak parent tracking'de yok. "
+                            f"Yeni stop konulmuyor."
+                        )
+                        out["success"] = True
+                        out["status"] = "already_filled_terminal"
+                        out["order_id"] = live.get("orderId") or cid
+                        out["not_modified"] = True
+                        return out
+
+                    # Gerçek dolum miktarını cumExecQty'den çek (qty veya pos.amount fallback'i KULLANILMAZ!)
+                    try:
+                        cum_exec_raw = live.get("cumExecQty")
+                        cum_exec = Decimal(str(cum_exec_raw)) if (cum_exec_raw is not None and str(cum_exec_raw).strip() != "") else None
+                    except Exception:
+                        cum_exec = None
+
+                    # cumExecQty eksik/geçersizse execution endpoint'inden Trade bazlı doğrula
+                    if cum_exec is None or cum_exec <= Decimal("0"):
+                        try:
+                            ex_res = await self._bybit_raw_get(
+                                connector,
+                                f"/v5/execution/list?category=linear&symbol={trading_pair}&orderId={live.get('orderId') or cid}"
+                            )
+                            ex_list = (ex_res or {}).get("result", {}).get("list", []) or []
+                            expected_close_side = "Sell" if ps == "LONG" else "Buy"
+                            target_order_id = str(live.get("orderId") or "")
+                            target_cid = str(cid or "")
+
+                            seen_execs = set()
+                            sum_exec = Decimal("0")
+                            for ex in ex_list:
+                                if str(ex.get("execType") or "").lower() != "trade":
+                                    continue
+                                if str(ex.get("side") or "").capitalize() != expected_close_side:
+                                    continue
+                                ex_oid = str(ex.get("orderId") or "")
+                                ex_cid = str(ex.get("orderLinkId") or "")
+                                if target_order_id and ex_oid != target_order_id and ex_cid != target_cid:
+                                    continue
+                                eid = ex.get("execId")
+                                if eid and eid not in seen_execs:
+                                    seen_execs.add(eid)
+                                    sum_exec += Decimal(str(ex.get("execQty") or 0))
+                            if sum_exec > Decimal("0"):
+                                cum_exec = sum_exec
+                        except Exception as _ex_err:
+                            self.logger().debug(f"[EXEC LIST LOOKUP] {_ex_err}")
+
+                    # Eğer fill miktarı hala doğrulanamıyorsa: BELİRSİZ!
+                    if cum_exec is None or cum_exec <= Decimal("0"):
+                        self.logger().warning(
+                            f"⚠️ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
+                            f"emir ({cid}) Filled görünüyor ancak execType=Trade ile doğrulanmış cumExecQty bulunamadı. "
+                            f"qty/amount varsayımı KULLANILMIYOR; parent silinmeden salt-okunur reconcile bekleniyor."
+                        )
+                        out["success"] = False
+                        out["status"] = "ambiguous_fill_preserved"
+                        out["order_id"] = live.get("orderId") or cid
+                        out["not_modified"] = True
+                        return out
+
+                    parent_remaining = Decimal(str(pos_match.get("remaining_amount", pos_match.get("amount", 0)) or 0))
+                    applied_fills = pos_match.setdefault("applied_cumulative_fill", {})
+                    fill_key = str(live.get("orderId") or cid)
+                    prev_applied = Decimal(str(applied_fills.get(fill_key, "0")))
+
+                    # Idempotent Muhasebe: Yalnızca yeni dolum farkı hesaplanır
+                    new_delta = max(Decimal("0"), cum_exec - prev_applied)
+
+                    # Durum: Fazla Dolum (Over-Fill: new_delta > parent_remaining)
+                    if new_delta > parent_remaining:
+                        self.logger().warning(
+                            f"⚠️ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
+                            f"yeni stop dolumu farkı ({new_delta}) parent kalanından ({parent_remaining}) büyük! "
+                            f"Sibling etkisi belirsiz; parent tracking'den silinmiyor."
+                        )
+                        out["success"] = False
+                        out["status"] = "overfill_ambiguous_preserved"
+                        out["order_id"] = live.get("orderId") or cid
+                        out["not_modified"] = True
+                        return out
+
+                    if new_delta > Decimal("0"):
+                        new_rem = max(Decimal("0"), parent_remaining - new_delta)
+                        pos_match["remaining_amount"] = float(new_rem)
+                        applied_fills[fill_key] = str(cum_exec)
+                        save_ok = self._save_state()
+                        if not save_ok:
+                            self.logger().error(
+                                f"❌ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
+                                f"state kaydetme başarısız! Belirsiz durum korunuyor, sessiz başarı verilmiyor."
+                            )
+                            out["success"] = False
+                            out["status"] = "state_save_failed"
+                            out["error"] = "state_save_failed"
+                            return out
+                    else:
+                        new_rem = parent_remaining
+
+                    # Durum 1: Kısmi Dolum / Residual Kalan (new_rem > 0)
+                    if new_rem > Decimal("0"):
+                        # Kalan miktar için aktif stop varlığını borsa emirlerinden denetle
+                        residual_covered = False
+                        try:
+                            active_conds = await self._get_bybit_conditional_orders(connector, trading_pair, ps)
+                            expected_pidx = self._bybit_position_idx(connector, ps, is_open=True)
+                            expected_close_side = "SELL" if ps == "LONG" else "BUY"
+                            parent_sl = Decimal(str(pos_match.get("sl") or 0))
+                            ACTIVE_STATUS_ALLOWLIST = {"untriggered", "new", "active"}
+
+                            for c in (active_conds or []):
+                                # 1. SL türü kontrolü
+                                if c.get("kind") != "SL":
+                                    continue
+
+                                # 2. Parent kimliği kontrolü (Sibling stopunu ASLA residual koruması sayma!)
+                                c_pid = c.get("parent_id")
+                                if c_pid is None or str(c_pid) != str(burned_parent):
+                                    continue
+
+                                # 3. Residual miktarı kontrolü (enstrüman miktar hassasiyetine göre tam eşitlik)
+                                c_qty = Decimal(str(c.get("qty") or 0))
+                                q_c_qty = connector.quantize_order_amount(trading_pair, c_qty)
+                                q_new_rem = connector.quantize_order_amount(trading_pair, new_rem)
+                                if q_c_qty != q_new_rem or q_c_qty < q_new_rem:
+                                    continue
+
+                                # 4. Fiyat kontrolü (SL trigger fiyatı geçerli ve parent SL seviyesini karşılıyor mu?)
+                                c_trig = Decimal(str(c.get("triggerPrice") or c.get("price") or 0))
+                                if c_trig <= Decimal("0"):
+                                    continue
+                                if parent_sl > Decimal("0"):
+                                    if ps == "LONG" and c_trig < parent_sl:
+                                        continue
+                                    if ps == "SHORT" and c_trig > parent_sl:
+                                        continue
+
+                                # 5. Aktif durum kontrolü (AÇIK İZİN LİSTESİ - Eksik/boş/unknown reddedilir)
+                                raw_status = c.get("orderStatus")
+                                if raw_status is None:
+                                    continue
+                                c_status = str(raw_status).strip().lower()
+                                if not c_status or c_status == "unknown" or c_status not in ACTIVE_STATUS_ALLOWLIST:
+                                    continue
+
+                                # 6. Doğru pozisyon bacağı kontrolü (positionIdx ve side - Eksik/boş/hatalı reddedilir)
+                                raw_side = c.get("side")
+                                if raw_side is None:
+                                    continue
+                                c_side = str(raw_side).strip().upper()
+                                if not c_side or c_side != expected_close_side:
+                                    continue
+
+                                c_pidx = c.get("positionIdx")
+                                if c_pidx is None:
+                                    continue
+                                try:
+                                    c_pidx_int = int(c_pidx)
+                                except (ValueError, TypeError):
+                                    continue
+                                if c_pidx_int not in (1, 2) or c_pidx_int != expected_pidx:
+                                    continue
+
+                                # Tüm 6 kriter eksiksiz sağlandı:
+                                residual_covered = True
+                                break
+                        except Exception as _ce:
+                            self.logger().debug(f"[RESIDUAL STOP CHECK] {_ce}")
+
+                        if residual_covered:
+                            self.logger().info(
+                                f"🛡️ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
+                                f"kısmi stop dolumu sonrası kalan {new_rem} aktif stopla korunuyor."
+                            )
+                            out["success"] = True
+                            out["status"] = "partial_fill_covered"
+                            out["remaining_amount"] = str(new_rem)
+                            out["order_id"] = live.get("orderId") or cid
+                            out["not_modified"] = True
+                            return out
+                        else:
+                            self.logger().warning(
+                                f"🔓 [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
+                                f"kısmi stop dolumu sonrası kalan {new_rem} için aktif stop YOK! "
+                                f"Korumasız/belirsiz durum işaretlendi."
+                            )
+                            out["success"] = False
+                            out["status"] = "unprotected_residual"
+                            out["error"] = f"unprotected_residual_{new_rem}"
+                            out["remaining_amount"] = str(new_rem)
+                            out["order_id"] = live.get("orderId") or cid
+                            out["not_modified"] = False
+                            return out
+
+                    # Durum 3: Tam Dolum (new_rem == 0)
+                    # TAZE ve BAŞARILI borsa pozisyon snapshot'ı (ensure_fresh=True) ZORUNLUDUR!
+                    try:
+                        real_pos_amt = await self._get_cached_position_amount(
+                            trading_pair, ps, ensure_fresh=True, reason="terminal_verify_snapshot"
+                        )
+                    except Exception:
+                        real_pos_amt = None
+
+                    if real_pos_amt is None or Decimal(str(real_pos_amt)) < Decimal("0"):
+                        self.logger().warning(
+                            f"⚠️ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
+                            f"stop tam doldu ancak taze borsa snapshot'ı alınamadı/doğrulanamadı; parent silinmiyor."
+                        )
+                        out["success"] = False
+                        out["status"] = "missing_snapshot_preserved"
+                        out["error"] = "fresh_exchange_snapshot_unverified"
+                        out["order_id"] = live.get("orderId") or cid
+                        out["not_modified"] = True
+                        return out
+
+                    other_parents = [
+                        p for p in (self._tracked_positions.get(trading_pair, {}) or {}).get(ps, []) or []
+                        if str(p.get("order_id")) != str(burned_parent)
+                    ]
+                    expected_remaining_exchange = sum(
+                        Decimal(str(p.get("remaining_amount", p.get("amount", 0)) or 0))
+                        for p in other_parents
+                    )
+
+                    q_real = connector.quantize_order_amount(trading_pair, Decimal(str(real_pos_amt)))
+                    q_expected = connector.quantize_order_amount(trading_pair, expected_remaining_exchange)
+
+                    # Borsa miktarı sibling toplamıyla birebir (quantize hassasiyetinde) uyuşmalıdır.
+                    # %5 tolerans KALDIRILMIŞTIR: en ufak gerçek farkta bile terminal cleanup engellenir.
+                    if q_real != q_expected:
+                        self.logger().warning(
+                            f"⚠️ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
+                            f"stop tam doldu ancak borsa pozisyonu ({q_real}) "
+                            f"kalan sibling toplamıyla ({q_expected}) tam uyuşmuyor (fark={abs(q_real - q_expected)}). "
+                            f"Sıfır tolerans mutabakatı gereği parent silinmiyor, belirsiz state korunuyor."
+                        )
+                        out["success"] = False
+                        out["status"] = "aggregate_mismatch_preserved"
+                        out["order_id"] = live.get("orderId") or cid
+                        out["not_modified"] = True
+                        return out
+
+                    # Bütün kanıt zinciri TAM:
+                    fill_px = Decimal(str(live.get("avgPrice") or live.get("price") or pos_match.get("sl") or 0))
+                    try:
+                        self._archive_trigger_close(
+                            trading_pair,
+                            ps,
+                            pos_match,
+                            burned_parent,
+                            kind,
+                            {
+                                "orderId": live.get("orderId") or cid,
+                                "qty": str(cum_exec),
+                                "price": str(fill_px),
+                                "time": int(live.get("updatedTime") or time.time() * 1000),
+                            },
+                        )
+                    except Exception as _ae:
+                        self.logger().debug(f"[REST FILLED archive] {_ae}")
+
+                    self._cleanup_position_tracking(trading_pair, ps, burned_parent)
+                    save_ok = self._save_state()
+                    if not save_ok:
+                        self.logger().error(
+                            f"❌ [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
+                            f"terminal cleanup sonrası state kaydetme başarısız!"
+                        )
+                        out["success"] = False
+                        out["status"] = "state_save_failed"
+                        out["error"] = "terminal_state_save_failed"
+                        return out
+
+                    self.logger().info(
+                        f"🛑 [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
+                        f"tam dolum kanıtlandı (qty={cum_exec} @ {fill_px}); parent güvenle kapatıldı."
+                    )
+                    out["success"] = True
+                    out["status"] = "already_filled_terminal"
+                    out["order_id"] = live.get("orderId") or cid
+                    out["not_modified"] = True
+                    return out
+
+                # (c) CID yanmış (Cancelled/Deactivated/vb.) → generation artırıp yeniden create et.
+                # ANCAK borsa pozisyonu 0 ise yeni generation stop koyulmaz!
+                try:
+                    real_pos_amt = await self._get_cached_position_amount(
+                        trading_pair, ps, ensure_fresh=False, reason="cid_burned_check"
+                    )
+                    if real_pos_amt is not None and Decimal(str(real_pos_amt)) <= Decimal("0"):
+                        self.logger().warning(
+                            f"🛑 [BYBIT COND {kind}] {trading_pair} {ps} #{burned_parent} - "
+                            f"CID yanmış ({cid}, status={live_status}) ancak borsa pozisyonu sıfır! "
+                            f"Yetim stop üretilmiyor."
+                        )
+                        out["error"] = "zero_position_no_stop"
+                        return out
+                except Exception:
+                    pass
+
                 prev_cid = cid
                 for _rot in range(self.BYBIT_CID_ROTATE_TRIES):
                     new_cid = self._bybit_bump_cid_generation(burned_parent, kind)
@@ -2851,6 +3241,19 @@ class TVSignalStrategy(ScriptStrategyBase):
             if not self._is_bybit_connector(connector):
                 out["error"] = "not_bybit"
                 return out
+
+            if position_order_id:
+                for tp_dict in getattr(self, "_tracked_positions", {}).values():
+                    for p_list in tp_dict.values():
+                        for p in p_list:
+                            if p.get("order_id") == position_order_id:
+                                if p.get("unresolved_qty_mismatch") or not p.get("reconciliation_verified", True):
+                                    out["error"] = "unresolved_qty_mismatch"
+                                    self.logger().warning(
+                                        f"⚠️ [BYBIT SLTP BLOCKED] #{position_order_id} - Miktar uzlaştırılmamış; "
+                                        f"stop-miktarı değişikliği üretilemez."
+                                    )
+                                    return out
 
             # 🔗 KONSOLİDE TARAF GUARD (tek choke-point — tüm caller'ları kapsar:
             # entry, phase2, trailing, naked-recovery, periodic verify, health, batch)
@@ -3281,6 +3684,7 @@ class TVSignalStrategy(ScriptStrategyBase):
                         "qty": q,
                         "positionIdx": pidx,
                         "side": (o.get("side") or "").upper(),
+                        "orderStatus": o.get("orderStatus"),
                         # v4.0: koşullu leg → 10'luk kotayı TÜKETİR
                         "is_limit": False,
                         "consumes_cond_slot": True,
@@ -9175,22 +9579,19 @@ class TVSignalStrategy(ScriptStrategyBase):
                 self.logger().debug(f"[SL COVERAGE] periodic: {_cg}")
 
             def _has_leg(orders, pid_, piece_qty):
-                if not orders:
+                if not orders or not pid_:
                     return False
-                # 1) CID (parent_id) ile KESİN eşleşme
-                if pid_:
-                    for o in orders:
-                        if o.get("parent_id") == pid_:
-                            return True
-                # 2) qty (±%5) ile yaklaşık eşleşme (CID yoksa)
-                if piece_qty is None or piece_qty <= 0:
-                    return True
+                q_piece = connector.quantize_order_amount(trading_pair, piece_qty) if piece_qty and piece_qty > 0 else None
                 for o in orders:
-                    oq = o.get("qty", Decimal("0"))
-                    if oq <= 0:
-                        return True
-                    if abs(oq - piece_qty) <= (piece_qty * Decimal("0.05")):
-                        return True
+                    # Parent kimliği KESİNLİKLE eşleşmeli (Sibling stopu koruma sayılamaz)
+                    if str(o.get("parent_id")) != str(pid_):
+                        continue
+                    # Miktar kontrolü: parça miktarı biliniyorsa tam quantize eşitliği zorunludur
+                    if q_piece is not None:
+                        oq = connector.quantize_order_amount(trading_pair, Decimal(str(o.get("qty", 0) or 0)))
+                        if oq != q_piece:
+                            continue
+                    return True
                 return False
 
             for pos in list(positions):
@@ -9285,9 +9686,17 @@ class TVSignalStrategy(ScriptStrategyBase):
 
                 # Konulamayan leg'leri AÇIKÇA raporla (sessiz naked parça olmasın)
                 unplaced = []
-                if need_sl and not sl_ok:
+                sl_safe = r.get("sl_status") in (
+                    "already_filled_terminal",
+                    "partial_fill_covered",
+                )
+                tp_safe = r.get("tp_status") in (
+                    "already_filled_terminal",
+                    "partial_fill_covered",
+                )
+                if need_sl and not sl_ok and not sl_safe:
                     unplaced.append(f"SL({r.get('sl_status') or r.get('error')})")
-                if need_tp and not tp_ok:
+                if need_tp and not tp_ok and not tp_safe:
                     unplaced.append(f"TP({r.get('tp_status') or r.get('error')})")
                 if unplaced:
                     self.logger().warning(
@@ -12550,7 +12959,8 @@ class TVSignalStrategy(ScriptStrategyBase):
                         k: tracked.get(k)
                         for k in (
                             "management_stage", "tp1_done", "confirmed_sl",
-                            "pending_target_sl", "tp1_intent", "r1_price", "r2_price",
+                            "pending_target_sl", "tp1_intent", "r1_price", "r2_price", "r3_price",
+                            "r_distance_orig", "r_eff_entry", "r_sl_baseline",
                             "fifo_attribution_ambiguous", "fifo_attribution_mismatch",
                             "trailing_anchor_price", "peak_price",
                         )
@@ -17150,11 +17560,6 @@ class TVSignalStrategy(ScriptStrategyBase):
         zararsızdır (ikinci iptal "not exist" → başarı sayılır).
         """
         try:
-            try:
-                fill_qty = Decimal(str(ex.get("execQty") or ex.get("closedSize") or 0))
-            except Exception:
-                fill_qty = Decimal("0")
-
             # parçayı bul
             pieces = list(
                 (self._tracked_positions.get(trading_pair, {}) or {}).get(side, [])
@@ -17162,22 +17567,64 @@ class TVSignalStrategy(ScriptStrategyBase):
             piece = next(
                 (p for p in pieces if p.get("order_id") == parent_id), None
             )
-            piece_rem = Decimal("0")
-            if piece is not None:
-                try:
-                    piece_rem = Decimal(
-                        str(piece.get("remaining_amount", piece.get("amount", 0)) or 0)
-                    )
-                except Exception:
-                    piece_rem = Decimal("0")
+            if piece is None:
+                return
 
-            full_close = piece_rem <= 0 or (
-                fill_qty > 0 and fill_qty >= piece_rem * Decimal("0.95")
-            )
+            # 1. WS execId bazında tekilleştirme (aynı gerçekleşme asla iki kez düşülmez)
+            exec_id = str(ex.get("execId") or "").strip()
+            order_id = str(ex.get("orderId") or ex.get("orderLinkId") or "").strip()
+            applied_execs = piece.setdefault("applied_exec_ids", {})
+            applied_fills = piece.setdefault("applied_cumulative_fill", {})
+            order_ws_fills = piece.setdefault("ws_fills_by_order", {})
+
+            if exec_id and exec_id in applied_execs:
+                self.logger().debug(
+                    f"🔁 [WS LEG FILL] Duplicate execId={exec_id} already applied for #{parent_id}, skipping"
+                )
+                return
+
+            try:
+                raw_fill = Decimal(str(ex.get("execQty") or ex.get("closedSize") or 0))
+            except Exception:
+                raw_fill = Decimal("0")
+            fill_qty = connector.quantize_order_amount(trading_pair, raw_fill) if hasattr(connector, "quantize_order_amount") else raw_fill
+            if fill_qty <= Decimal("0"):
+                return
+
+            # 2. REST kümülatif dolumlarıyla mutabakat: Bu gerçekleşme daha önce REST tarafından düşüldü mü?
+            prev_cum_applied = Decimal(str(applied_fills.get(order_id, "0")))
+            prev_ws_for_order = Decimal(str(order_ws_fills.get(order_id, "0")))
+            new_ws_for_order = prev_ws_for_order + fill_qty
+
+            if new_ws_for_order <= prev_cum_applied:
+                # Bu gerçekleşme REST cumExecQty içinde zaten düşülmüştür; ek miktar düşülmez
+                new_delta = Decimal("0")
+            else:
+                new_delta = new_ws_for_order - max(prev_cum_applied, prev_ws_for_order)
+
+            if exec_id:
+                applied_execs[exec_id] = str(fill_qty)
+            order_ws_fills[order_id] = str(new_ws_for_order)
+            applied_fills[order_id] = str(max(prev_cum_applied, new_ws_for_order))
+
+            # 3. Doğrulanmış yeni dolum farkını kalan miktardan düş
+            piece_rem = Decimal(str(piece.get("remaining_amount", piece.get("amount", 0)) or 0))
+            if new_delta > Decimal("0"):
+                piece_rem = max(Decimal("0"), piece_rem - new_delta)
+                piece["remaining_amount"] = float(piece_rem)
+                save_ok = self._save_state()
+                if not save_ok:
+                    self.logger().error(f"❌ [WS LEG FILL] State save failed for #{parent_id}")
+                    return
+
+            # 4. full_close kararı KESİNLİKLE tekilleştirme ve yeni dolum hesabı yapıldıktan sonra verilir!
+            q_piece_rem = connector.quantize_order_amount(trading_pair, piece_rem) if hasattr(connector, "quantize_order_amount") else piece_rem
+            full_close = (q_piece_rem <= Decimal("0"))
+
             if not full_close:
                 self.logger().info(
                     f"📏 [WS LEG FILL] {trading_pair} {side} #{parent_id} {kind} "
-                    f"KISMİ fill ({fill_qty}/{piece_rem}) → parça takipte kalıyor"
+                    f"KISMİ fill (delta={new_delta}, rem={piece_rem}) → parça takipte kalıyor"
                 )
                 return
 
@@ -25495,6 +25942,8 @@ class TVSignalStrategy(ScriptStrategyBase):
         mode = self._pm_mode()
         if mode == "passive":
             return False
+        if pos_data.get("unresolved_qty_mismatch") or not pos_data.get("reconciliation_verified", True):
+            return False
         if mode == "rr2_trailing":
             return str(pos_data.get("management_stage") or "") == "RR2_TRAIL_2R"
         if mode == "hybrid_trailing":
@@ -25555,7 +26004,7 @@ class TVSignalStrategy(ScriptStrategyBase):
             if pos_data.get("r_baseline_untrusted"):
                 if not pos_data.get("management_stage"):
                     pos_data["management_stage"] = (
-                        "HYBRID_TRAIL_1R" if self._pm_mode() == "hybrid_trailing" else "RR2_TRAIL_2R"
+                        "HYBRID_HOLD_ENTRY" if self._pm_mode() == "hybrid_trailing" else "RR2_TRAIL_2R"
                     )
                 return bool(pos_data.get("trailing_anchor_price"))
 
@@ -25601,6 +26050,31 @@ class TVSignalStrategy(ScriptStrategyBase):
                 )
                 return True
 
+            if self._pm_mode() == "hybrid_trailing":
+                R = abs(entry - baseline_sl)
+                if R <= Decimal("0"):
+                    return False
+                if side == "LONG":
+                    r1_price = entry + R
+                    r2_price = entry + (Decimal("2") * R)
+                    r3_price = entry + (Decimal("3") * R)
+                elif side == "SHORT":
+                    r1_price = entry - R
+                    r2_price = entry - (Decimal("2") * R)
+                    r3_price = entry - (Decimal("3") * R)
+                else:
+                    return False
+
+                pos_data["r_sl_baseline"] = baseline_sl
+                pos_data["r_eff_entry"] = entry
+                pos_data["r_distance_orig"] = R
+                pos_data["r1_price"] = r1_price
+                pos_data["r2_price"] = r2_price
+                pos_data["r3_price"] = r3_price
+                if not pos_data.get("management_stage"):
+                    pos_data["management_stage"] = "HYBRID_WAIT"
+                return True
+
             eff_entry, risk_eff, r1_price, r2_price = self._fee_adjusted_r_targets(
                 side, entry, baseline_sl
             )
@@ -25613,7 +26087,7 @@ class TVSignalStrategy(ScriptStrategyBase):
             pos_data["r1_price"] = r1_price
             pos_data["r2_price"] = r2_price
             if not pos_data.get("management_stage"):
-                pos_data["management_stage"] = "HYBRID_WAIT" if self._pm_mode() == "hybrid_trailing" else "RR2_WAIT"
+                pos_data["management_stage"] = "RR2_WAIT"
             return True
         except Exception:
             return False
@@ -25759,9 +26233,8 @@ class TVSignalStrategy(ScriptStrategyBase):
             pos_data.pop("r2_price", None)
             pos_data.pop("r_sl_baseline", None)
 
-            stage = "HYBRID_TRAIL_1R"
+            stage = "HYBRID_HOLD_ENTRY"
             pos_data["management_stage"] = stage
-            pos_data["be_05_done"] = True
             pos_data["tp1_done"] = False
             pos_data["tp1_blocked"] = True
             pos_data["auto_tp1_blocked"] = True
@@ -25867,6 +26340,8 @@ class TVSignalStrategy(ScriptStrategyBase):
             side = str(pos_data.get("side") or "").upper()
             order_id = int(pos_data.get("order_id") or 0)
             if side not in ("LONG", "SHORT") or order_id <= 0:
+                return False
+            if pos_data.get("unresolved_qty_mismatch") or not pos_data.get("reconciliation_verified", True):
                 return False
             if str(pos_data.get("management_stage") or "RR2_WAIT") != "RR2_WAIT":
                 return False
@@ -26131,6 +26606,12 @@ class TVSignalStrategy(ScriptStrategyBase):
         try:
             if position_order_id in self._rr2_failclose_inflight:
                 return False
+            if pos_data.get("unresolved_qty_mismatch") or not pos_data.get("reconciliation_verified", True):
+                self.logger().warning(
+                    f"⚠️ [RR2 FAILSAFE BLOCKED] #{position_order_id} - Miktar uzlaştırılmamış; "
+                    f"kapatma emri üretilemez."
+                )
+                return False
             self._rr2_failclose_inflight.add(position_order_id)
 
             live = await self._get_cached_position_amount(
@@ -26217,6 +26698,29 @@ class TVSignalStrategy(ScriptStrategyBase):
             )
         )
 
+    def _update_hybrid_peak_price(self, pos_data: dict, price: Decimal) -> None:
+        """Kural 1: WAIT ve pending aşamalarında gözlenen lehte fiyat/milestone bilgisini koru."""
+        try:
+            if price is None:
+                return
+            p = Decimal(str(price))
+            if p <= Decimal("0"):
+                return
+            side = str(pos_data.get("side") or "").upper()
+            if side not in ("LONG", "SHORT"):
+                return
+            curr_peak = pos_data.get("peak_price")
+            if curr_peak is None:
+                pos_data["peak_price"] = p
+            else:
+                curr_peak = Decimal(str(curr_peak))
+                if side == "LONG" and p > curr_peak:
+                    pos_data["peak_price"] = p
+                elif side == "SHORT" and p < curr_peak:
+                    pos_data["peak_price"] = p
+        except Exception:
+            pass
+
     def _try_trigger_hybrid_management(
         self,
         exchange: str,
@@ -26227,14 +26731,18 @@ class TVSignalStrategy(ScriptStrategyBase):
     ) -> bool:
         """
         Hybrid Trailing Trigger:
-        1) Girişten %0.5 kârda stopu başabaşa (entry) taşır (komisyonsuz ham entry).
-        2) 1R seviyesi geçildiğinde TP1 (%50) kısmi kapatma ve BE aşamasını başlatır.
+        1) 1R seviyesi geçildiğinde TP1 (%50) kısmi kapatma ve BE aşamasını başlatır.
+        2) WAIT ve pending aşamalarında gözlenen lehte peak/milestone fiyatı korunur.
         """
         try:
             side = str(pos_data.get("side") or "").upper()
             order_id = int(pos_data.get("order_id") or 0)
             if side not in ("LONG", "SHORT") or order_id <= 0:
                 return False
+
+            # WAIT ve pending aşamalarında gözlenen lehte fiyat/milestone bilgisini koru
+            if price is not None and price > Decimal("0"):
+                self._update_hybrid_peak_price(pos_data, price)
 
             if not self._trading_allowed(context="hybrid_trigger"):
                 return False
@@ -26318,27 +26826,79 @@ class TVSignalStrategy(ScriptStrategyBase):
                             self.logger().warning(f"⚠️ [HYBRID BE RETRY] Task spawn failed: {_ce}")
                 return True
 
+            # Belirsiz / uzlaştırılmamış parent yeni emir veya aşama geçişi üretemez
+            if pos_data.get("unresolved_qty_mismatch") or not pos_data.get("reconciliation_verified", True):
+                return False
+
             _unconf = (getattr(self, "_unconfirmed_closes", None) or {}).get(lock_key)
             if _unconf and (
                 time.time() - float(_unconf.get("last_seen") or 0)
             ) < 120:
                 return False
 
-            # 1) Girişten %0.5 kârda entry koruması (1R'den önce veya 1R ile eşzamanlı)
-            if not pos_data.get("be_05_done"):
-                entry = Decimal(str(pos_data.get("entry") or "0"))
-                if entry > 0:
-                    crossed_05 = (
-                        (price >= entry * Decimal("1.005"))
-                        if side == "LONG"
-                        else (price <= entry * Decimal("0.995"))
-                    )
-                    if crossed_05:
-                        asyncio.create_task(
-                            self._hybrid_apply_05_be(exchange, trading_pair, pos_data, entry)
-                        )
+            # 1R-2R Arası Bekleme (HYBRID_HOLD_ENTRY) -> 2R veya 3R geçiş kontrolü
+            if stage == "HYBRID_HOLD_ENTRY":
+                r2_price = Decimal(str(pos_data.get("r2_price") or "0"))
+                r3_price = Decimal(str(pos_data.get("r3_price") or "0"))
+                if r3_price <= 0:
+                    R = Decimal(str(pos_data.get("r_distance_orig") or "0"))
+                    entry_p = Decimal(str(pos_data.get("entry") or "0"))
+                    if R > 0 and entry_p > 0:
+                        r3_price = entry_p + (Decimal("3") * R) if side == "LONG" else entry_p - (Decimal("3") * R)
+                        pos_data["r3_price"] = r3_price
 
-            # 2) 1R Tetikleyici Kontrolü
+                reached_3r = ((price >= r3_price) if side == "LONG" else (price <= r3_price)) if r3_price > 0 else False
+                if reached_3r:
+                    pos_data["management_stage"] = "HYBRID_TRAIL_3R"
+                    pos_data["trailing_anchor_price"] = price
+                    _peak = pos_data.get("peak_price") or price
+                    pos_data["peak_price"] = max(_peak, price) if side == "LONG" else min(_peak, price)
+                    self._save_state()
+                    self.logger().info(
+                        f"🚀 [HYBRID 3R DIRECT] {trading_pair} {side} #{order_id} - Fiyat tek hamlede 3R geçti: "
+                        f"fiyat={price}, R3={r3_price}. RR2 ratchet devraldı."
+                    )
+                    self._maybe_schedule_trailing(exchange, trading_pair, price, pos_data)
+                    return True
+
+                reached_2r = ((price >= r2_price) if side == "LONG" else (price <= r2_price)) if r2_price > 0 else False
+                if reached_2r:
+                    pos_data["management_stage"] = "HYBRID_TRAIL_2R"
+                    pos_data["trailing_anchor_price"] = price
+                    _peak = pos_data.get("peak_price") or price
+                    pos_data["peak_price"] = max(_peak, price) if side == "LONG" else min(_peak, price)
+                    self._save_state()
+                    self.logger().info(
+                        f"🚀 [HYBRID 2R REACHED] {trading_pair} {side} #{order_id} - 2R seviyesi geçildi: "
+                        f"fiyat={price}, R2={r2_price}. Normal trailing başlatıldı."
+                    )
+                    self._maybe_schedule_trailing(exchange, trading_pair, price, pos_data)
+                    return True
+                # 1R–2R arasında trailing çalışmasın; doğrulanmış entry stop korunsun
+                return False
+
+            # 2R Trailing aşamasında 3R Ratchet'e geçiş kontrolü
+            if stage == "HYBRID_TRAIL_2R":
+                r3_price = Decimal(str(pos_data.get("r3_price") or "0"))
+                if r3_price <= 0:
+                    R = Decimal(str(pos_data.get("r_distance_orig") or "0"))
+                    entry_p = Decimal(str(pos_data.get("entry") or "0"))
+                    if R > 0 and entry_p > 0:
+                        r3_price = entry_p + (Decimal("3") * R) if side == "LONG" else entry_p - (Decimal("3") * R)
+                        pos_data["r3_price"] = r3_price
+                reached_3r = ((price >= r3_price) if side == "LONG" else (price <= r3_price)) if r3_price > 0 else False
+                if reached_3r:
+                    pos_data["management_stage"] = "HYBRID_TRAIL_3R"
+                    self._save_state()
+                    self.logger().info(
+                        f"🚀 [HYBRID 3R REACHED] {trading_pair} {side} #{order_id} - 3R seviyesi geçildi: "
+                        f"fiyat={price}, R3={r3_price}. RR2 ratchet devraldı."
+                    )
+                    self._maybe_schedule_trailing(exchange, trading_pair, price, pos_data)
+                    return True
+                return False
+
+            # 1R Tetikleyici Kontrolü (HYBRID_WAIT)
             if pos_data.get("tp1_blocked") or pos_data.get("auto_tp1_blocked"):
                 return False
             if stage != "HYBRID_WAIT":
@@ -26468,6 +27028,9 @@ class TVSignalStrategy(ScriptStrategyBase):
             if order_id <= 0 or side not in ("LONG", "SHORT"):
                 return
 
+            if current_price is not None and current_price > Decimal("0"):
+                self._update_hybrid_peak_price(pos_data, current_price)
+
             if not self._trading_allowed(context="hybrid_activate"):
                 return
 
@@ -26489,10 +27052,14 @@ class TVSignalStrategy(ScriptStrategyBase):
             if close_amount <= 0:
                 return
 
-            await self._hybrid_execute_tp1_close(
+            executed = await self._hybrid_execute_tp1_close(
                 connector, exchange, trading_pair, pos_data, close_amount, current_price
             )
+            if not executed and pos_data.get("management_stage") == "HYBRID_TRANSITIONING":
+                pos_data["management_stage"] = "HYBRID_WAIT"
         except Exception as e:
+            if pos_data.get("management_stage") == "HYBRID_TRANSITIONING":
+                pos_data["management_stage"] = "HYBRID_WAIT"
             self.logger().error(f"❌ [HYBRID ACTIVATE] #{order_id} hata: {e}", exc_info=True)
         finally:
             self._hybrid_transitioning_orders.discard(order_id)
@@ -26507,7 +27074,16 @@ class TVSignalStrategy(ScriptStrategyBase):
         close_amount: Decimal,
         current_price: Decimal,
     ) -> bool:
+        if current_price is not None and current_price > Decimal("0"):
+            self._update_hybrid_peak_price(pos_data, current_price)
+
         if pos_data.get("tp1_done", False):
+            return False
+        if pos_data.get("unresolved_qty_mismatch") or not pos_data.get("reconciliation_verified", True):
+            self.logger().warning(
+                f"⚠️ [HYBRID TP1 BLOCKED] #{pos_data.get('order_id')} - Miktar uzlaştırılmamış "
+                f"(status={pos_data.get('reconciliation_status')}); yeni TP1 emri üretilemez."
+            )
             return False
         intent = pos_data.get("tp1_intent")
         if intent and intent.get("status") in ("SUBMITTED", "COMPLETED", "FILL_VERIFIED"):
@@ -26529,6 +27105,46 @@ class TVSignalStrategy(ScriptStrategyBase):
 
         lock_key = f"{trading_pair}_{side}"
         if lock_key in getattr(self, "_orders_being_placed", set()):
+            return False
+
+        # Step normalization before intent persistence (pre-order safety):
+        tr = connector.trading_rules.get(trading_pair) if (connector and hasattr(connector, "trading_rules")) else None
+        if not tr or not hasattr(tr, "min_base_amount_increment"):
+            self.logger().warning(
+                f"⚠️ [HYBRID TP1 ABORT] #{order_id} {trading_pair}: Trading rule or min_base_amount_increment missing"
+            )
+            if pos_data.get("management_stage") == "HYBRID_TRANSITIONING":
+                pos_data["management_stage"] = "HYBRID_WAIT"
+            return False
+
+        try:
+            step_raw = getattr(tr, "min_base_amount_increment", None)
+            step = Decimal(str(step_raw if step_raw is not None else 0))
+            if not step.is_finite() or step.is_nan() or step.is_infinite():
+                raise ValueError(f"Non-finite step: {step_raw}")
+        except Exception as _e:
+            self.logger().warning(
+                f"⚠️ [HYBRID TP1 ABORT] #{order_id} {trading_pair}: Invalid min_base_amount_increment: {_e}"
+            )
+            if pos_data.get("management_stage") == "HYBRID_TRANSITIONING":
+                pos_data["management_stage"] = "HYBRID_WAIT"
+            return False
+
+        if step <= Decimal("0"):
+            self.logger().warning(
+                f"⚠️ [HYBRID TP1 ABORT] #{order_id} {trading_pair}: Non-positive qtyStep ({step})"
+            )
+            if pos_data.get("management_stage") == "HYBRID_TRANSITIONING":
+                pos_data["management_stage"] = "HYBRID_WAIT"
+            return False
+
+        close_amount = (close_amount // step) * step
+        if close_amount <= Decimal("0"):
+            self.logger().warning(
+                f"⚠️ [HYBRID TP1 ABORT] #{order_id} {trading_pair}: close_amount zero after step normalization (step={step})"
+            )
+            if pos_data.get("management_stage") == "HYBRID_TRANSITIONING":
+                pos_data["management_stage"] = "HYBRID_WAIT"
             return False
 
         # Bybit CID sanitization: alfanumerik linkId
@@ -26671,7 +27287,7 @@ class TVSignalStrategy(ScriptStrategyBase):
             # Partial fill kontrolü
             if target_close_qty > Decimal("0") and current_filled >= target_close_qty:
                 pos_data["tp1_done"] = True
-                if pos_data.get("management_stage") not in ("HYBRID_TRAIL_1R", "HYBRID_TRAIL_2R"):
+                if pos_data.get("management_stage") not in ("HYBRID_HOLD_ENTRY", "HYBRID_TRAIL_2R", "HYBRID_TRAIL_3R"):
                     pos_data["management_stage"] = "HYBRID_TP1_FILLED_SL_PENDING"
                 intent["status"] = "FILL_VERIFIED"
             else:
@@ -26773,7 +27389,8 @@ class TVSignalStrategy(ScriptStrategyBase):
                                 f"🛑 [HYBRID PENDING RECONCILE] {trading_pair} {side} #{pos_data.get('order_id')} "
                                 f"- CID {cid} borsada sıfır dolumla sonlandı ({st}), HYBRID_WAIT aşamasına dönülüyor"
                             )
-                            pos_data["management_stage"] = "HYBRID_WAIT"
+                            if not (pos_data.get("unresolved_qty_mismatch") or not pos_data.get("reconciliation_verified", True)):
+                                pos_data["management_stage"] = "HYBRID_WAIT"
                             intent["status"] = f"ABORTED_{st.upper()}"
                             self._save_state()
                             return True
@@ -26813,6 +27430,12 @@ class TVSignalStrategy(ScriptStrategyBase):
         self, connector, trading_pair: str, side: str, pos_data: dict
     ) -> bool:
         try:
+            if pos_data.get("unresolved_qty_mismatch") or not pos_data.get("reconciliation_verified", True):
+                self.logger().warning(
+                    f"⚠️ [HYBRID RETRY BE BLOCKED] #{pos_data.get('order_id')} - Miktar uzlaştırılmamış; "
+                    f"SL güncellemesi yapılamaz."
+                )
+                return False
             order_id = int(pos_data.get("order_id") or 0)
             entry = Decimal(str(pos_data.get("entry") or "0"))
             side_u = str(side or "").upper()
@@ -26847,10 +27470,49 @@ class TVSignalStrategy(ScriptStrategyBase):
 
                 if price_ok and qty_ok:
                     pos_data["confirmed_sl"] = live_price
+                    pos_data["sl"] = live_price
+                    pos_data["last_logged_sl"] = live_price
                     pos_data.pop("pending_target_sl", None)
-                    pos_data["management_stage"] = "HYBRID_TRAIL_1R"
+                    r2_p = Decimal(str(pos_data.get("r2_price") or "0"))
+                    r3_p = Decimal(str(pos_data.get("r3_price") or "0"))
+                    if r3_p <= 0:
+                        R = Decimal(str(pos_data.get("r_distance_orig") or "0"))
+                        if R > 0 and entry > 0:
+                            r3_p = entry + (Decimal("3") * R) if side_u == "LONG" else entry - (Decimal("3") * R)
+                            pos_data["r3_price"] = r3_p
+                    _chk_price = Decimal(str(pos_data.get("peak_price") or pos_data.get("entry") or "0"))
+                    if r3_p > 0 and ((_chk_price >= r3_p) if side_u == "LONG" else (_chk_price <= r3_p)):
+                        next_st = "HYBRID_TRAIL_3R"
+                    elif r2_p > 0 and ((_chk_price >= r2_p) if side_u == "LONG" else (_chk_price <= r2_p)):
+                        next_st = "HYBRID_TRAIL_2R"
+                    else:
+                        next_st = "HYBRID_HOLD_ENTRY"
+                    pos_data["management_stage"] = next_st
                     pos_data["trailing_anchor_price"] = live_price
                     self._save_state()
+
+                    # 🚀 Kural 3: Doğrulama sonrası uygun 2R/3R aşamasına geçip mevcut scheduler üzerinden işi başlat.
+                    if next_st in ("HYBRID_TRAIL_2R", "HYBRID_TRAIL_3R"):
+                        cur_p = None
+                        if hasattr(self, "_bybit_fresh_price"):
+                            cur_p = self._bybit_fresh_price(trading_pair, "last")
+                        if not cur_p and connector and hasattr(connector, "get_mid_price"):
+                            cur_p = connector.get_mid_price(trading_pair)
+                        if not cur_p:
+                            cur_p = _chk_price
+                        else:
+                            cur_p = Decimal(str(cur_p))
+
+                        ex = pos_data.get("exchange")
+                        if not ex:
+                            for ex_name, conn in getattr(self, "connectors", {}).items():
+                                if conn is connector:
+                                    ex = ex_name
+                                    break
+                        if not ex:
+                            ex = getattr(self, "_default_exchange", "bybit_perpetual_demo")
+                        self._maybe_schedule_trailing(ex, trading_pair, cur_p, pos_data)
+
                     return True
 
             # If not matching or not found, place/amend trading stop
@@ -26901,10 +27563,49 @@ class TVSignalStrategy(ScriptStrategyBase):
 
                 if p_ok and q_ok:
                     pos_data["confirmed_sl"] = f_price
+                    pos_data["sl"] = f_price
+                    pos_data["last_logged_sl"] = f_price
                     pos_data.pop("pending_target_sl", None)
-                    pos_data["management_stage"] = "HYBRID_TRAIL_1R"
+                    r2_p = Decimal(str(pos_data.get("r2_price") or "0"))
+                    r3_p = Decimal(str(pos_data.get("r3_price") or "0"))
+                    if r3_p <= 0:
+                        R = Decimal(str(pos_data.get("r_distance_orig") or "0"))
+                        if R > 0 and entry > 0:
+                            r3_p = entry + (Decimal("3") * R) if side_u == "LONG" else entry - (Decimal("3") * R)
+                            pos_data["r3_price"] = r3_p
+                    _chk_price = Decimal(str(pos_data.get("peak_price") or pos_data.get("entry") or "0"))
+                    if r3_p > 0 and ((_chk_price >= r3_p) if side_u == "LONG" else (_chk_price <= r3_p)):
+                        next_st = "HYBRID_TRAIL_3R"
+                    elif r2_p > 0 and ((_chk_price >= r2_p) if side_u == "LONG" else (_chk_price <= r2_p)):
+                        next_st = "HYBRID_TRAIL_2R"
+                    else:
+                        next_st = "HYBRID_HOLD_ENTRY"
+                    pos_data["management_stage"] = next_st
                     pos_data["trailing_anchor_price"] = f_price
                     self._save_state()
+
+                    # 🚀 Kural 3: Doğrulama sonrası uygun 2R/3R aşamasına geçip mevcut scheduler üzerinden işi başlat.
+                    if next_st in ("HYBRID_TRAIL_2R", "HYBRID_TRAIL_3R"):
+                        cur_p = None
+                        if hasattr(self, "_bybit_fresh_price"):
+                            cur_p = self._bybit_fresh_price(trading_pair, "last")
+                        if not cur_p and connector and hasattr(connector, "get_mid_price"):
+                            cur_p = connector.get_mid_price(trading_pair)
+                        if not cur_p:
+                            cur_p = _chk_price
+                        else:
+                            cur_p = Decimal(str(cur_p))
+
+                        ex = pos_data.get("exchange")
+                        if not ex:
+                            for ex_name, conn in getattr(self, "connectors", {}).items():
+                                if conn is connector:
+                                    ex = ex_name
+                                    break
+                        if not ex:
+                            ex = getattr(self, "_default_exchange", "bybit_perpetual_demo")
+                        self._maybe_schedule_trailing(ex, trading_pair, cur_p, pos_data)
+
                     return True
 
             self.logger().warning(
@@ -26934,7 +27635,9 @@ class TVSignalStrategy(ScriptStrategyBase):
             return
         now = time.time()
         if (
-            pos_data.get("_be_retry_inflight")
+            pos_data.get("unresolved_qty_mismatch")
+            or not pos_data.get("reconciliation_verified", True)
+            or pos_data.get("_be_retry_inflight")
             or now - float(pos_data.get("hybrid_be_last_try") or 0) < 5
         ):
             return
@@ -26958,6 +27661,121 @@ class TVSignalStrategy(ScriptStrategyBase):
                 pos_data["_be_retry_inflight"] = False
                 pos_data["_be_retry_task"] = None
                 self.logger().warning(f"⚠️ [HYBRID BE RETRY] Task spawn failed: {_ce}")
+
+    async def _hybrid_verify_bybit_sl_order(
+        self,
+        connector,
+        trading_pair: str,
+        side: str,
+        position_order_id: int,
+        target_sl: Decimal,
+        expected_qty: Decimal,
+    ) -> Optional[Decimal]:
+        """
+        Bybit açık koşullu (SL) emirlerini sorgulayarak doğru parent, kalan miktar
+        ve geçerli stop fiyatını doğrular.
+
+        Başarılıysa gözlenen gerçek borsa tetik fiyatını (Decimal) döner.
+        Borsa eski fiyat/miktarı gösteriyorsa veya emir henüz yansımamışsa None döner.
+        Eksik, sıfır, negatif veya sonlu olmayan stop fiyatı ya da geçersiz yön/miktar
+        durumunda kesinlikle None döner.
+        """
+        try:
+            # 1. Önkoşullar: Geçerli yön ("LONG" veya "SHORT")
+            side_u = str(side or "").upper().strip()
+            if side_u not in ("LONG", "SHORT"):
+                return None
+
+            try:
+                p_order_id = int(position_order_id or 0)
+            except Exception:
+                return None
+            if p_order_id <= 0:
+                return None
+
+            # Hedef SL kontrolü: Pozitif ve sonlu Decimal olmalı
+            try:
+                if target_sl is None:
+                    return None
+                target_sl = Decimal(str(target_sl).strip())
+                if target_sl.is_nan() or target_sl.is_infinite() or target_sl <= Decimal("0"):
+                    return None
+            except Exception:
+                return None
+
+            # Beklenen miktar kontrolü: Pozitif ve sonlu Decimal olmalı
+            try:
+                if expected_qty is None:
+                    return None
+                expected_qty = Decimal(str(expected_qty).strip())
+                if expected_qty.is_nan() or expected_qty.is_infinite() or expected_qty <= Decimal("0"):
+                    return None
+            except Exception:
+                return None
+
+            if not self._is_bybit_connector(connector):
+                return target_sl
+
+            fresh_orders = await self._get_bybit_conditional_orders(
+                connector, trading_pair, side_u
+            )
+            matching_leg = None
+            for o in fresh_orders or []:
+                try:
+                    p_id = int(o.get("parent_id") or 0)
+                    kind = str(o.get("kind") or "").upper()
+                    if p_id == p_order_id and kind == "SL":
+                        matching_leg = o
+                        break
+                except Exception:
+                    pass
+
+            if matching_leg is None:
+                return None
+
+            # 2. Borsa tetik fiyatı doğrulaması:
+            # Eksik, boş, sıfır, negatif veya sonlu olmayan değerler kesinlikle REDDEDİLİR.
+            # (Özellikle SHORT için triggerPrice="0" veya eksik trigger asla doğrulanmış sayılamaz)
+            raw_price = matching_leg.get("triggerPrice") or matching_leg.get("stopPrice")
+            if raw_price is None or str(raw_price).strip() in ("", "0", "0.0", "0.00", "None", "null"):
+                return None
+            try:
+                f_price = Decimal(str(raw_price).strip())
+                if f_price.is_nan() or f_price.is_infinite() or f_price <= Decimal("0"):
+                    return None
+            except Exception:
+                return None
+
+            # 3. Borsa miktar doğrulaması:
+            # Pozitif, sonlu ve beklenen kalan miktar ile tam eşleşmeli
+            raw_qty = matching_leg.get("qty")
+            if raw_qty is None or str(raw_qty).strip() in ("", "0", "0.0", "0.00", "None", "null"):
+                return None
+            try:
+                f_qty = Decimal(str(raw_qty).strip())
+                if f_qty.is_nan() or f_qty.is_infinite() or f_qty <= Decimal("0"):
+                    return None
+            except Exception:
+                return None
+
+            if f_qty != expected_qty:
+                return None
+
+            # 4. Fiyat sınır kontrolü:
+            # LONG için borsa stopu hedeften gevşek olmamalı
+            # SHORT için borsa stopu hedeften gevşek olmamalı (f_price <= target_sl + 1e-6)
+            # Not: f_price > 0 olduğu garanti edildiğinden f_price="0" SHORT'u yanıltamaz
+            if side_u == "LONG":
+                if f_price < (target_sl - Decimal("1e-6")):
+                    return None
+            elif side_u == "SHORT":
+                if f_price > (target_sl + Decimal("1e-6")):
+                    return None
+
+            return f_price
+        except Exception as e:
+            self.logger().warning(f"⚠️ [HYBRID SL VERIFY] Hata: {e}")
+            return None
 
     def _try_trigger_legacy_phase2(
         self,
@@ -27093,6 +27911,8 @@ class TVSignalStrategy(ScriptStrategyBase):
             oid = pos_data.get("order_id", 0)
             if not oid:
                 return
+            if pos_data.get("unresolved_qty_mismatch") or not pos_data.get("reconciliation_verified", True):
+                return
             if not hasattr(self, "_bybit_trail_sched_ts"):
                 self._bybit_trail_sched_ts = {}
             now = time.time()
@@ -27218,6 +28038,9 @@ class TVSignalStrategy(ScriptStrategyBase):
                                     f"⚠️ [MONITOR] {trading_pair} {side} - invalid/missing order_id={order_id}; removing from tracked_positions"
                                 )
                                 continue
+
+                            if self._pm_mode() == "hybrid_trailing" and mid_price and mid_price > Decimal("0"):
+                                self._update_hybrid_peak_price(pos_data, mid_price)
 
                             # FAZ 2: Dynamic SL trailing (1R'den sonra aktif)
                             # 🔥 CRITICAL: Sadece aktivasyon TAMAMLANDIYSA trailing başlat!
@@ -27523,6 +28346,53 @@ class TVSignalStrategy(ScriptStrategyBase):
                         trading_pair in self._tracked_positions
                         and len(self._tracked_positions[trading_pair].get(side, [])) > 0
                     )
+
+                    if is_tracked:
+                        # 🔒 Runtime Uzlaştırma (Snapshot Doğrulama + Aggregate Grup Tutarlılığı)
+                        # 1. Snapshot doğrulanmamışsa (TTL aşımı, fetch hatası, unverified cache) bekleyen hiçbir yönetimi açma
+                        if self._is_exchange_snapshot_verified():
+                            tracked_list = self._tracked_positions[trading_pair].get(side, [])
+                            active_group = [
+                                p for p in tracked_list
+                                if Decimal(str(p.get("remaining_amount", p.get("amount", 0)))) > Decimal("0")
+                            ]
+                            has_pending = any(
+                                p.get("reconciliation_status") == "PENDING_EXCHANGE_VERIFICATION"
+                                for p in active_group
+                            )
+                            if has_pending:
+                                aggregate_remaining = sum(
+                                    Decimal(str(p.get("remaining_amount", p.get("amount", 0))))
+                                    for p in active_group
+                                )
+                                real_amt = abs(Decimal(str(pos_amount)))
+                                group_diff = abs(aggregate_remaining - real_amt)
+
+                                # Grup tutarlı ise (aggregate remaining == real_amt):
+                                if real_amt > Decimal("0") and group_diff <= Decimal("1e-6"):
+                                    state_dirty = False
+                                    for tracked_p in active_group:
+                                        # ⚠️ YALNIZ PENDING_EXCHANGE_VERIFICATION kayıtlarını aç!
+                                        # UNRESOLVED_DISCREPANCY veya execution/attribution karantinasındaki kayıtları temizleme!
+                                        if tracked_p.get("reconciliation_status") == "PENDING_EXCHANGE_VERIFICATION":
+                                            tracked_p["reconciliation_verified"] = True
+                                            tracked_p["reconciliation_status"] = "VERIFIED_MATCH"
+                                            tracked_p["unresolved_qty_mismatch"] = False
+                                            tracked_p["discrepancy_amount"] = Decimal("0")
+                                            self.logger().info(
+                                                f"✅ [RECOVERY VERIFIED] {trading_pair} {side} #{tracked_p.get('order_id')} - "
+                                                f"Grup borsa miktarı ({real_amt}) ile başarıyla uzlaştırıldı. Yönetim mutasyonları açıldı."
+                                            )
+                                            state_dirty = True
+                                    if state_dirty:
+                                        self._save_state()
+                                else:
+                                    # Grup tutarsız (örn. 9 + 9 != 9): hiçbir pending parent'ın yönetimini açma!
+                                    self.logger().warning(
+                                        f"⚠️ [RECOVERY GROUP MISMATCH] {trading_pair} {side} grup uzlaştırılamadı: "
+                                        f"Grup aktif kalan: {aggregate_remaining}, Borsa: {real_amt}, Fark: {group_diff}. "
+                                        f"Grup tutarlı olmadan hiçbir pending parent'ın yönetimi açılamaz."
+                                    )
 
                     if not is_tracked:
                         # 🚫 SPAM ÖNLEMİ: Başarısız auto-detect'leri takip et
@@ -27859,17 +28729,29 @@ class TVSignalStrategy(ScriptStrategyBase):
         elif self._pm_mode() == "hybrid_trailing":
             _base_sl = Decimal(str(sl_price or "0"))
             _re = Decimal(str(real_entry or "0"))
-            _eff, _rdist, _r1, _r2 = self._fee_adjusted_r_targets(
-                side, _re, _base_sl
-            )
+            _rdist = abs(_re - _base_sl)
+            side_u = str(side or "").upper()
+            if side_u == "LONG":
+                _r1 = _re + _rdist
+                _r2 = _re + (Decimal("2") * _rdist)
+                _r3 = _re + (Decimal("3") * _rdist)
+            elif side_u == "SHORT":
+                _r1 = _re - _rdist
+                _r2 = _re - (Decimal("2") * _rdist)
+                _r3 = _re - (Decimal("3") * _rdist)
+            else:
+                _r1 = _r2 = _r3 = Decimal("0")
+
             position_data.update(
                 {
                     "r_sl_baseline": _base_sl,
-                    "r_eff_entry": _eff,
+                    "r_eff_entry": _re,
                     "r_distance_orig": _rdist,
                     "r1_price": _r1,
                     "r2_price": _r2,
+                    "r3_price": _r3,
                     "management_stage": "HYBRID_WAIT",
+                    "peak_price": _re,
                     "rr2_stop_placed_at": Decimal("0"),
                     "trailing_anchor_price": Decimal("0"),
                     "rr2_original_tp": Decimal(str(signal_tp or 0)),
@@ -27882,7 +28764,7 @@ class TVSignalStrategy(ScriptStrategyBase):
                 position_data["phase2_tp_mode"] = "rr2_no_tp"
             self.logger().info(
                 f"🔀 [HYBRID TRACK] {trading_pair} {side} #{order_id} - "
-                f"entry={_re}, baseline SL={_base_sl}, R1={_r1}, R2={_r2} "
+                f"entry={_re}, baseline SL={_base_sl}, R1={_r1}, R2={_r2}, R3={_r3} "
                 f"(stage=HYBRID_WAIT, tp_suppressed=True)"
             )
 
@@ -33293,7 +34175,33 @@ class TVSignalStrategy(ScriptStrategyBase):
                 exchange=exchange, trading_pair=trading_pair,
                 new_sl=target, side=side, position_order_id=position_order_id,
             )
-            if not moved:
+            observed_sl = None
+            if moved:
+                is_hybrid = (
+                    (self._pm_mode() == "hybrid_trailing")
+                    if hasattr(self, "_pm_mode")
+                    else (
+                        getattr(self, "POSITION_MANAGEMENT_MODE", None) == "hybrid_trailing"
+                        or getattr(self, "_position_management", None) == "hybrid_trailing"
+                    )
+                )
+                if is_hybrid:
+                    connector = self._get_connector(exchange)
+                    rem_amt = Decimal(
+                        str(pos_data.get("remaining_amount") or pos_data.get("amount") or "0")
+                    )
+                    observed_sl = await self._hybrid_verify_bybit_sl_order(
+                        connector=connector,
+                        trading_pair=trading_pair,
+                        side=side,
+                        position_order_id=position_order_id,
+                        target_sl=target,
+                        expected_qty=rem_amt,
+                    )
+                else:
+                    observed_sl = target
+
+            if not moved or observed_sl is None:
                 if prev_logged is not None:
                     pos_data["last_logged_sl"] = prev_logged   # L33060 hayalet yazısını geri al
                 retry_ts[position_order_id] = now_ts
@@ -33308,8 +34216,9 @@ class TVSignalStrategy(ScriptStrategyBase):
                 return
 
             retry_ts.pop(position_order_id, None)
-            pos_data["sl"] = target
-            pos_data["last_logged_sl"] = target
+            pos_data["sl"] = observed_sl
+            pos_data["last_logged_sl"] = observed_sl
+            pos_data["confirmed_sl"] = observed_sl
             self.logger().info(
                 f"{'🔺' if side == 'LONG' else '🔻'} [RR2 RATCHET] {trading_pair} {side} "
                 f"#{position_order_id} - peak={peak}, k={k_peak}, floor={floor}, "
@@ -33460,96 +34369,170 @@ class TVSignalStrategy(ScriptStrategyBase):
                 )
                 return
 
-            # 🔀 HYBRID TRAILING: 1R-2R strict trailing ve 2R'da RR2 ratchet'e geçiş
+            # 🔀 HYBRID TRAILING:
+            # - 1R–2R arasında trailing çalışmaz; doğrulanmış entry stop korunur (HYBRID_HOLD_ENTRY)
+            # - 2R seviyesi geçildiğinde normal trailing (zirveden/ilerlemeden dinamik SL) başlar (HYBRID_TRAIL_2R)
+            # - 3R seviyesi geçildiğinde RR2 ratchet mantığına devredilir (HYBRID_TRAIL_3R)
+            # - Tek olayda atlamalarda doğrudan ilgili aşamaya geçilir
             if _pm == "hybrid_trailing":
                 stage = str(pos_data.get("management_stage") or "")
                 r2_price = Decimal(str(pos_data.get("r2_price") or "0"))
-                reached_2r = (
-                    (current_price >= r2_price) if side == "LONG" else (current_price <= r2_price)
-                ) if r2_price > 0 else False
+                r3_price = Decimal(str(pos_data.get("r3_price") or "0"))
+                if r3_price <= 0:
+                    R = Decimal(str(pos_data.get("r_distance_orig") or "0"))
+                    entry_p = Decimal(str(pos_data.get("entry") or "0"))
+                    if R > 0 and entry_p > 0:
+                        r3_price = entry_p + (Decimal("3") * R) if side == "LONG" else entry_p - (Decimal("3") * R)
+                        pos_data["r3_price"] = r3_price
 
-                if stage == "HYBRID_TRAIL_2R" or reached_2r:
-                    if stage != "HYBRID_TRAIL_2R":
-                        r1_price = Decimal(str(pos_data.get("r1_price") or "0"))
-                        curr_sl = Decimal(str(pos_data.get("confirmed_sl") or pos_data.get("sl") or "0"))
-                        transition_sl = (max(curr_sl, r1_price) if side == "LONG" else min(curr_sl, r1_price)) if r1_price > 0 else curr_sl
-                        if transition_sl > 0:
-                            # Item 1: Strict 2R sonucu False iken stage/confirmed SL ilerlemesin; mevcut RR2 failsafe sözleşmesi korunsun
-                            sl_ok = await self._update_trailing_sl_rr2_strict(
-                                exchange=exchange,
-                                trading_pair=trading_pair,
-                                new_sl=transition_sl,
-                                side=side,
-                                position_order_id=position_order_id,
-                            )
-                            if not sl_ok:
-                                self.logger().warning(
-                                    f"⚠️ [HYBRID 2R TRANSITION] {trading_pair} {side} #{position_order_id} - "
-                                    f"2R transition SL ({transition_sl}) failed -> do not advance stage or confirmed SL"
-                                )
-                                await self._rr2_failsafe_close_parent(
-                                    exchange, trading_pair, side, position_order_id, current_price,
-                                    pos_data, reason="hybrid_2r_sl_placement_failed",
-                                )
-                                return
-                            pos_data["management_stage"] = "HYBRID_TRAIL_2R"
-                            pos_data["confirmed_sl"] = transition_sl
-                            pos_data["sl"] = transition_sl
-                            pos_data["last_logged_sl"] = transition_sl
-                            pos_data["trailing_anchor_price"] = current_price
-                        else:
-                            pos_data["management_stage"] = "HYBRID_TRAIL_2R"
+                reached_3r = ((current_price >= r3_price) if side == "LONG" else (current_price <= r3_price)) if r3_price > 0 else False
+                reached_2r = ((current_price >= r2_price) if side == "LONG" else (current_price <= r2_price)) if r2_price > 0 else False
+
+                # 3R ve üzeri: RR2 ratchet mantığı
+                if stage == "HYBRID_TRAIL_3R" or reached_3r:
+                    if stage != "HYBRID_TRAIL_3R":
+                        pos_data["management_stage"] = "HYBRID_TRAIL_3R"
+                        self._save_state()
+                        self.logger().info(
+                            f"🚀 [HYBRID 3R RATCHET] {trading_pair} {side} #{position_order_id} - "
+                            f"3R seviyesi ({r3_price}) geçildi → RR2 ratchet devraldı (fiyat={current_price})"
+                        )
                     await self._rr2_ratchet_trailing(
                         exchange, trading_pair, side, pos_data, current_price, position_order_id
                     )
                     return
 
-                # 1R–2R Arası Strict Trailing (%0.2 hareket / %0.1 stop adımı)
-                # Item 7: 1R–2R başarısız trailing amend'i yeni peak olmadan 3s sonra retry edilsin
-                now_ts = time.time()
-                retry_ts = getattr(self, "_hybrid_trail_retry_ts", None)
-                if retry_ts is None:
-                    retry_ts = {}
-                    self._hybrid_trail_retry_ts = retry_ts
+                # 2R–3R arası: Normal trailing (zirveden dinamik SL taşıma)
+                if stage == "HYBRID_TRAIL_2R" or reached_2r:
+                    if stage != "HYBRID_TRAIL_2R":
+                        pos_data["management_stage"] = "HYBRID_TRAIL_2R"
+                        pos_data["trailing_anchor_price"] = current_price
+                        self._save_state()
+                        self.logger().info(
+                            f"🚀 [HYBRID 2R TRAIL] {trading_pair} {side} #{position_order_id} - "
+                            f"2R seviyesi ({r2_price}) geçildi → normal dinamik trailing başlatıldı (fiyat={current_price})"
+                        )
 
-                if now_ts - float(retry_ts.get(position_order_id, 0) or 0) < 3.0:
+                    now_ts = time.time()
+                    retry_ts = getattr(self, "_hybrid_trail_retry_ts", None)
+                    if retry_ts is None:
+                        retry_ts = {}
+                        self._hybrid_trail_retry_ts = retry_ts
+
+                    if now_ts - float(retry_ts.get(position_order_id, 0) or 0) < 3.0:
+                        return
+
+                    new_sl = None
+                    if side == "LONG":
+                        price_increase_pct = ((peak_price - entry_price) / entry_price) * 100
+                        expected_sl_level = int(price_increase_pct // Decimal("0.2"))
+                        cand_sl = entry_price * (1 + (expected_sl_level * Decimal("0.001")))
+                        current_sl = max(
+                            Decimal(str(pos_data.get("confirmed_sl") or 0)),
+                            Decimal(str(pos_data.get("sl") or 0)),
+                            Decimal(str(pos_data.get("last_logged_sl") or 0)),
+                            Decimal(str(entry_price or 0)),
+                        )
+                        if cand_sl > current_sl + (entry_price * Decimal("0.0005")):
+                            new_sl = cand_sl
+                    elif side == "SHORT":
+                        price_decrease_pct = ((entry_price - peak_price) / entry_price) * 100
+                        expected_sl_level = int(price_decrease_pct // Decimal("0.2"))
+                        cand_sl = entry_price * (1 - (expected_sl_level * Decimal("0.001")))
+                        cands = [
+                            Decimal(str(pos_data[k]))
+                            for k in ("confirmed_sl", "sl", "last_logged_sl", "entry")
+                            if pos_data.get(k) and Decimal(str(pos_data[k])) > 0
+                        ]
+                        current_sl = min(cands) if cands else entry_price
+                        if cand_sl < current_sl - (entry_price * Decimal("0.0005")):
+                            new_sl = cand_sl
+
+                    if new_sl is not None:
+                        # 🔧 FIX: Normal hibrit 2R çağrı noktasında tek operasyonel hedef üret.
+                        # Request ve doğrulayıcı aynı quantize edilmiş hedefi kullanır.
+                        # Quantize hatasında ham hedefle sessiz devam edilmez; stop/state korunup retry edilir.
+                        raw_target = new_sl
+                        quantize_fn = getattr(connector, "quantize_order_price", None)
+                        if not callable(quantize_fn):
+                            retry_ts[position_order_id] = now_ts
+                            self.logger().warning(
+                                f"⚠️ [HYBRID TRAIL 2R RETRY] {trading_pair} {side} #{position_order_id} "
+                                f"- connector quantize_order_price çağrılamıyor; stop/state korunup 3s sonra retry"
+                            )
+                            return
+
+                        try:
+                            q_target = quantize_fn(trading_pair, raw_target)
+                            if q_target is None:
+                                raise ValueError("quantize_order_price None döndürdü")
+                            operational_sl = Decimal(str(q_target))
+                            if (
+                                operational_sl <= Decimal("0")
+                                or operational_sl.is_nan()
+                                or operational_sl.is_infinite()
+                            ):
+                                raise ValueError(f"Geçersiz quantize edilmiş sl: {operational_sl}")
+                        except Exception as q_err:
+                            retry_ts[position_order_id] = now_ts
+                            self.logger().warning(
+                                f"⚠️ [HYBRID TRAIL 2R RETRY] {trading_pair} {side} #{position_order_id} "
+                                f"- quantize hatası: {q_err} (raw_target={raw_target}); "
+                                f"ham hedefle devam edilmiyor, stop/state korunup 3s sonra retry"
+                            )
+                            return
+
+                        # 🛡️ GEVŞETMEME KONTROLÜ: Operasyonel hedef mevcut en iyi stoptan daha iyi değilse gönderme
+                        if side == "LONG" and operational_sl <= current_sl:
+                            return
+                        if side == "SHORT" and operational_sl >= current_sl:
+                            return
+
+                        prev_logged = pos_data.get("last_logged_sl") or pos_data.get("sl")
+                        success = await self._update_trailing_sl_rr2_strict(
+                            exchange=exchange,
+                            trading_pair=trading_pair,
+                            new_sl=operational_sl,
+                            side=side,
+                            position_order_id=position_order_id,
+                        )
+                        observed_sl = None
+                        if success:
+                            connector = self._get_connector(exchange)
+                            rem_amt = Decimal(
+                                str(pos_data.get("remaining_amount") or pos_data.get("amount") or "0")
+                            )
+                            observed_sl = await self._hybrid_verify_bybit_sl_order(
+                                connector=connector,
+                                trading_pair=trading_pair,
+                                side=side,
+                                position_order_id=position_order_id,
+                                target_sl=operational_sl,
+                                expected_qty=rem_amt,
+                            )
+
+                        if observed_sl is not None:
+                            retry_ts.pop(position_order_id, None)
+                            pos_data["confirmed_sl"] = observed_sl
+                            pos_data["sl"] = observed_sl
+                            pos_data["last_logged_sl"] = observed_sl
+                            self.logger().info(
+                                f"{'🔺' if side == 'LONG' else '🔻'} [HYBRID 2R TRAIL] {trading_pair} {side} "
+                                f"#{position_order_id} - Peak: {peak_price}, SL: {last_logged_sl} → {observed_sl} "
+                                f"(raw_target={raw_target}, op_target={operational_sl}, observed={observed_sl})"
+                            )
+                        else:
+                            if prev_logged is not None:
+                                pos_data["last_logged_sl"] = prev_logged
+                            retry_ts[position_order_id] = now_ts
+                            self.logger().warning(
+                                f"⚠️ [HYBRID TRAIL 2R RETRY] {trading_pair} {side} #{position_order_id} "
+                                f"- op_target={operational_sl} (raw_target={raw_target}) borsada doğrulanamadı "
+                                f"(observed={observed_sl}); state yazılmadı, 3s sonra retry"
+                            )
                     return
 
-                new_sl = None
-                if side == "LONG":
-                    price_increase_pct = ((peak_price - entry_price) / entry_price) * 100
-                    expected_sl_level = int(price_increase_pct // Decimal("0.2"))
-                    cand_sl = entry_price * (1 + (expected_sl_level * Decimal("0.001")))
-                    last_logged_sl = pos_data.get("last_logged_sl", entry_price)
-                    if cand_sl > last_logged_sl + (entry_price * Decimal("0.0005")):
-                        new_sl = cand_sl
-                elif side == "SHORT":
-                    price_decrease_pct = ((entry_price - peak_price) / entry_price) * 100
-                    expected_sl_level = int(price_decrease_pct // Decimal("0.2"))
-                    cand_sl = entry_price * (1 - (expected_sl_level * Decimal("0.001")))
-                    last_logged_sl = pos_data.get("last_logged_sl", entry_price)
-                    if cand_sl < last_logged_sl - (entry_price * Decimal("0.0005")):
-                        new_sl = cand_sl
-
-                if new_sl is not None:
-                    success = await self._update_trailing_sl_rr2_strict(
-                        exchange=exchange,
-                        trading_pair=trading_pair,
-                        new_sl=new_sl,
-                        side=side,
-                        position_order_id=position_order_id,
-                    )
-                    if success:
-                        retry_ts.pop(position_order_id, None)
-                        pos_data["confirmed_sl"] = new_sl
-                        pos_data["sl"] = new_sl
-                        pos_data["last_logged_sl"] = new_sl
-                    else:
-                        retry_ts[position_order_id] = now_ts
-                        self.logger().warning(
-                            f"⚠️ [HYBRID TRAIL 1R-2R RETRY] {trading_pair} {side} #{position_order_id} "
-                            f"- new_sl={new_sl} yerleştirilemedi; yeni peak olmadan 3s sonra retry edilecek"
-                        )
+                # 1R–2R arasında trailing çalışmasın; doğrulanmış entry stop korunsun
                 return
 
             if not price_improved:
@@ -33965,15 +34948,27 @@ class TVSignalStrategy(ScriptStrategyBase):
             remaining_amount = Decimal("0")
             original_tp = Decimal("0")
 
+            target_pos = None
             for pair, sides_data in list(self._tracked_positions.items()):
                 if pair == trading_pair:
                     for pos_data in sides_data.get(side, []):
                         if pos_data.get("order_id") == position_order_id:
+                            target_pos = pos_data
                             remaining_amount = pos_data.get(
                                 "remaining_amount", pos_data.get("amount", Decimal("0"))
                             )
                             original_tp = pos_data.get("tp", Decimal("0"))
                             break
+
+            if target_pos is not None and (
+                target_pos.get("unresolved_qty_mismatch")
+                or not target_pos.get("reconciliation_verified", True)
+            ):
+                self.logger().warning(
+                    f"⚠️ [TRAILING SL BLOCKED] #{position_order_id} - Miktar uzlaştırılmamış "
+                    f"(status={target_pos.get('reconciliation_status')}); stop taşınamaz."
+                )
+                return False
 
             if remaining_amount <= 0:
                 self.logger().error(
@@ -35925,6 +36920,7 @@ class TVSignalStrategy(ScriptStrategyBase):
                                 ),
                                 "r1_price": float(pos_data.get("r1_price", 0) or 0),
                                 "r2_price": float(pos_data.get("r2_price", 0) or 0),
+                                "r3_price": float(pos_data.get("r3_price", 0) or 0),
                                 "rr2_stop_placed_at": float(
                                     pos_data.get("rr2_stop_placed_at", 0) or 0
                                 ),
@@ -35963,9 +36959,40 @@ class TVSignalStrategy(ScriptStrategyBase):
                                     pos_data.get("fifo_attribution_mismatch", False)
                                 ),
                                 "fifo_status": str(pos_data.get("fifo_status") or ""),
+                                "reconciliation_verified": bool(
+                                    pos_data.get("reconciliation_verified", True)
+                                ),
+                                "reconciliation_status": str(
+                                    pos_data.get("reconciliation_status") or ""
+                                ),
+                                "unresolved_qty_mismatch": bool(
+                                    pos_data.get("unresolved_qty_mismatch", False)
+                                ),
+                                "discrepancy_amount": float(
+                                    pos_data.get("discrepancy_amount", 0) or 0
+                                ),
+                                "exchange_real_amount": float(
+                                    pos_data.get("exchange_real_amount", 0) or 0
+                                ),
+                                "saved_aggregate_remaining": float(
+                                    pos_data.get("saved_aggregate_remaining", 0) or 0
+                                ),
+                                "accounted_exec_ids": list(
+                                    pos_data.get("accounted_exec_ids") or []
+                                ),
+                                "applied_cumulative_fill": dict(
+                                    pos_data.get("applied_cumulative_fill") or {}
+                                ),
+                                "applied_exec_ids": dict(
+                                    pos_data.get("applied_exec_ids") or {}
+                                ),
+                                "ws_fills_by_order": dict(
+                                    pos_data.get("ws_fills_by_order") or {}
+                                ),
                                 "peak_price": peak_val,
                                 "initial_sl": initial_sl_val,
                                 "phase2_first_sl": phase2_first_sl_val,
+                                "position_idx": pos_data.get("position_idx"),
                             }
                         )
 
@@ -36272,254 +37299,657 @@ class TVSignalStrategy(ScriptStrategyBase):
 
                 for side in ["LONG", "SHORT"]:
                     positions_list = sides_data.get(side, [])
+                    if not positions_list:
+                        continue
 
-                    for saved_pos in positions_list:
-                        # Gerçekten pozisyon var mı kontrol et
-                        real_pos_key = f"{trading_pair}_{side}"
-                        if real_pos_key in real_positions:
-                            real_pos = real_positions[real_pos_key]
+                    # Her (pair, side) grubu için uzlaştırma durumunu koşulsuz başlat (gruplar arası sızıntıyı önle)
+                    reconciliation_verified = False
+                    reconciliation_status = "UNRESOLVED_DISCREPANCY"
 
-                            # Pozisyon miktarı eşleşiyor mu?
-                            saved_amount = abs(Decimal(str(saved_pos["amount"])))
-                            real_amount = abs(Decimal(str(real_pos["amount"])))
+                    # Gerçekten pozisyon var mı kontrol et
+                    real_pos_key = f"{trading_pair}_{side}"
+                    is_snapshot_verified = self._is_exchange_snapshot_verified()
 
-                            # ✅ %10 tolerans (birleşik pozisyonlar için)
-                            if abs(saved_amount - real_amount) < (
-                                saved_amount * Decimal("0.10")
-                            ):
-                                # 🔥 FIX: Exchange name düzeltme ("testnet" → "binance_perpetual_testnet")
-                                exchange_name = saved_pos.get("exchange", "")
-                                if exchange_name == "testnet" or exchange_name == "":
-                                    exchange_name = "binance_perpetual_testnet"
-                                    self.logger().warning(
-                                        f"⚠️ [STATE FIX] {trading_pair} {side} - "
-                                        f"Exchange name 'testnet' → 'binance_perpetual_testnet' düzeltildi"
-                                    )
+                    if not is_snapshot_verified:
+                        # Borsa verisi henüz hazır değil / UNKNOWN: Parent'ı silme, normal dönüşüm yoluna sok:
+                        self.logger().warning(
+                            f"⚠️ [RECOVERY] {trading_pair} {side} borsa doğrulaması henüz tamamlanmadı (UNKNOWN). "
+                            f"Kayıtlı parent state korunarak PENDING_VERIFICATION aşamasında yükleniyor."
+                        )
+                        reconciliation_verified = False
+                        reconciliation_status = "PENDING_EXCHANGE_VERIFICATION"
+                        real_amount = Decimal("0")
+                        aggregate_remaining = sum(
+                            Decimal(str(p.get("remaining_amount", p.get("amount", 0))))
+                            for p in positions_list
+                        )
+                        diff = aggregate_remaining
+                    elif real_pos_key not in real_positions:
+                        self.logger().info(
+                            f"ℹ️ [RECOVERY] {trading_pair} {side} pozisyonu borsa doğrulamasıyla teyit edildi (kapatılmış)"
+                        )
+                        continue
+                    else:
+                        real_pos = real_positions[real_pos_key]
+                        real_amount = abs(Decimal(str(real_pos.get("amount", 0))))
+                        if real_amount <= Decimal("0"):
+                            self.logger().info(
+                                f"ℹ️ [RECOVERY] {trading_pair} {side} pozisyonu borsa miktarı 0 (kapatılmış)"
+                            )
+                            continue
 
-                                initial_sl_raw = saved_pos.get("initial_sl")
-                                if initial_sl_raw is None or str(initial_sl_raw) == "":
-                                    initial_sl_raw = saved_pos.get("sl", "0")
-                                phase2_first_sl_raw = saved_pos.get("phase2_first_sl")
-                                if phase2_first_sl_raw is None or str(phase2_first_sl_raw) == "":
-                                    phase2_first_sl_raw = initial_sl_raw
+                    # Kalan miktarı > 0 olan aktif parent'ları belirle
+                    active_saved = []
+                    for p in positions_list:
+                        rem_p = Decimal(str(p.get("remaining_amount", p.get("amount", 0))))
+                        if rem_p > Decimal("0"):
+                            active_saved.append(p)
 
-                                # State'i recover et
-                                position_data = {
-                                    "order_id": saved_pos.get("order_id", 0),
-                                    "exchange": exchange_name,  # Düzeltilmiş exchange name
-                                    "trading_pair": trading_pair,
-                                    "entry": Decimal(str(saved_pos["entry"])),
-                                    "sl": Decimal(str(saved_pos["sl"])),
-                                    "initial_sl": Decimal(str(initial_sl_raw)),
-                                    "phase2_first_sl": Decimal(str(phase2_first_sl_raw)),
-                                    "tp": Decimal(str(saved_pos["tp"])),
-                                    "amount": Decimal(str(saved_pos["amount"])),
-                                    "remaining_amount": Decimal(
-                                        str(
-                                            saved_pos.get(
-                                                "remaining_amount", saved_pos["amount"]
-                                            )
-                                        )
-                                    ),
-                                    "side": side,
-                                    "risk": Decimal(str(saved_pos["risk"])),
-                                    "1r_reached": saved_pos.get("1r_reached", False),
-                                    "phase2_active": saved_pos.get(
-                                        "phase2_active", False
-                                    ),
-                                    # 🔒 FIX BQ-2: Faz 2'nin TAM durumu geri yüklenir.
-                                    # Geriye uyum: eski dosyada activation_complete
-                                    # yoksa phase2_active'e eşitlenir (aktivasyon
-                                    # penceresi ~5 sn — kaydedilmiş bir phase2_active
-                                    # pratikte hep tamamlanmış demektir).
-                                    "phase2_activation_complete": bool(
-                                        saved_pos.get(
-                                            "phase2_activation_complete",
-                                            saved_pos.get("phase2_active", False),
-                                        )
-                                    ),
-                                    "phase2_tp_mode": str(
-                                        saved_pos.get("phase2_tp_mode", "order")
-                                        or "order"
-                                    ),
-                                    "phase2_tp2_done": bool(
-                                        saved_pos.get("phase2_tp2_done", False)
-                                    ),
-                                    "phase2_tp2_in_progress": False,
-                                    "exchange_order_id": saved_pos.get(
-                                        "exchange_order_id"
-                                    ),
-                                    # 🎯 FIX BR: sinyal üçlüsü + R/R oranı geri
-                                    # yüklenir (yoksa mevcut değerlere düşer →
-                                    # eski state dosyalarıyla geriye uyumlu).
-                                    "signal_entry": Decimal(
-                                        str(
-                                            saved_pos.get("signal_entry")
-                                            or saved_pos["entry"]
-                                        )
-                                    ),
-                                    "signal_tp": Decimal(
-                                        str(
-                                            saved_pos.get("signal_tp")
-                                            or saved_pos["tp"]
-                                        )
-                                    ),
-                                    # 🔀 FIX BV — RR2 state machine restore.
-                                    "management_stage": str(
-                                        saved_pos.get("management_stage") or ""
-                                    ),
-                                    "r_sl_baseline": Decimal(
-                                        str(saved_pos.get("r_sl_baseline") or 0)
-                                    ),
-                                    "r1_price": Decimal(
-                                        str(saved_pos.get("r1_price") or 0)
-                                    ),
-                                    "r2_price": Decimal(
-                                        str(saved_pos.get("r2_price") or 0)
-                                    ),
-                                    "rr2_stop_placed_at": Decimal(
-                                        str(saved_pos.get("rr2_stop_placed_at") or 0)
-                                    ),
-                                    "trailing_anchor_price": Decimal(
-                                        str(saved_pos.get("trailing_anchor_price") or 0)
-                                    ),
-                                    "tp_suppressed_by_rr2": bool(
-                                        saved_pos.get("tp_suppressed_by_rr2", False)
-                                    ),
-                                    "rr2_original_tp": Decimal(
-                                        str(saved_pos.get("rr2_original_tp") or 0)
-                                    ),
-                                    "rr2_failclose_last_try": float(
-                                        saved_pos.get("rr2_failclose_last_try") or 0
-                                    ),
-                                    "r_baseline_untrusted": bool(
-                                        saved_pos.get("r_baseline_untrusted", False)
-                                    ),
-                                    "last_logged_sl": Decimal(
-                                        str(
-                                            saved_pos.get(
-                                                "last_logged_sl", saved_pos["sl"]
-                                            )
-                                            or saved_pos["sl"]
-                                        )
-                                    ),
-                                    "peak_price": Decimal(
-                                        str(
-                                            saved_pos.get(
-                                                "peak_price", saved_pos["entry"]
-                                            )
-                                        )
-                                    ),
-                                    "tp1_done": bool(saved_pos.get("tp1_done", False)),
-                                    "be_05_done": bool(saved_pos.get("be_05_done", False)),
-                                    "confirmed_sl": (
-                                        Decimal(str(saved_pos.get("confirmed_sl")))
-                                        if saved_pos.get("confirmed_sl") is not None
-                                        else None
-                                    ),
-                                    "pending_target_sl": (
-                                        Decimal(str(saved_pos.get("pending_target_sl")))
-                                        if saved_pos.get("pending_target_sl") is not None
-                                        else None
-                                    ),
-                                    "tp1_intent": saved_pos.get("tp1_intent"),
-                                    "fifo_attribution_ambiguous": bool(
-                                        saved_pos.get("fifo_attribution_ambiguous", False)
-                                    ),
-                                    "fifo_attribution_mismatch": bool(
-                                        saved_pos.get("fifo_attribution_mismatch", False)
-                                    ),
-                                    "fifo_status": str(saved_pos.get("fifo_status") or ""),
-                                    "timestamp": self.current_timestamp,
-                                }
+                    if not active_saved:
+                        continue
 
-                                # r_distance_orig: yalnızca >0 ise anahtar konur —
-                                # 0 ile konursa `_try_trigger_phase2` "zaten var"
-                                # sanıp orijinal mesafeyi bir daha sabitlemez.
-                                try:
-                                    _rdo_saved = saved_pos.get("r_distance_orig")
-                                    if _rdo_saved and float(_rdo_saved) > 0:
-                                        position_data["r_distance_orig"] = Decimal(
-                                            str(_rdo_saved)
-                                        )
-                                    _ree_saved = saved_pos.get("r_eff_entry")
-                                    if _ree_saved and float(_ree_saved) > 0:
-                                        position_data["r_eff_entry"] = Decimal(
-                                            str(_ree_saved)
-                                        )
-                                    # 🎯 FIX BR: rr_target yoksa sinyal üçlüsünden
-                                    # yeniden türetilir (eski state dosyaları).
-                                    _rr_saved = saved_pos.get("rr_target")
-                                    if _rr_saved and float(_rr_saved) > 0:
-                                        position_data["rr_target"] = Decimal(
-                                            str(_rr_saved)
-                                        )
-                                    else:
-                                        position_data["rr_target"] = self._signal_rr(
-                                            side,
-                                            position_data.get("signal_entry"),
-                                            position_data.get("initial_sl"),
-                                            position_data.get("signal_tp"),
-                                        )
-                                except Exception:
-                                    pass
+                    # Borsa miktarı birleşik (net aggregate) pozisyondur.
+                    # Toplam kalan miktar uzlaştırması: tüm aktif parent'ların kalan miktarları toplamı
+                    aggregate_remaining = sum(
+                        Decimal(str(p.get("remaining_amount", p.get("amount", 0))))
+                        for p in active_saved
+                    )
 
-                                if position_data["remaining_amount"] <= Decimal("0"):
-                                    self.logger().info(
-                                        f"ℹ️ [RECOVERY PRUNE] {trading_pair} {side} #{position_data['order_id']} - "
-                                        f"remaining_amount <= 0, state'e geri alınmadı"
-                                    )
-                                    continue
+                    # Enstrümanın gerçek qtyStep (min_base_amount_increment) değerini belirle
+                    qty_step = Decimal("0.000001")
+                    connector_obj = None
+                    for sp in active_saved:
+                        ex_name = sp.get("exchange", "")
+                        conn = self._get_connector(ex_name) if hasattr(self, "_get_connector") else None
+                        if conn is None and hasattr(self, "connectors"):
+                            conn = self.connectors.get(ex_name)
+                        if conn:
+                            connector_obj = conn
+                            if hasattr(conn, "trading_rules"):
+                                tr = conn.trading_rules.get(trading_pair)
+                                if tr and getattr(tr, "min_base_amount_increment", None):
+                                    qty_step = Decimal(str(tr.min_base_amount_increment))
+                                    break
 
-                                if str(position_data.get("management_stage") or "") == "RR2_ARMED_R1":
-                                    position_data["management_stage"] = "RR2_TRAIL_2R"
-                                    if not position_data.get("trailing_anchor_price"):
-                                        position_data["trailing_anchor_price"] = (
-                                            position_data.get("rr2_stop_placed_at")
-                                            or position_data.get("sl")
-                                        )
-                                    self.logger().warning(
-                                        f"🔄 [RR2 LOAD MIGRATE] {trading_pair} {side} #{position_data.get('order_id')} - "
-                                        f"Eski 'RR2_ARMED_R1' aşaması tespit edildi → 'RR2_TRAIL_2R' olarak güncellendi "
-                                        f"(anchor={position_data.get('trailing_anchor_price')})"
-                                    )
+                    # Yalnız doğrulanmış borsa snapshot'ı varsa uzlaştırma hesapla; UNKNOWN ise PENDING durumunu koru
+                    matched_parent_execs = {}
+                    is_precision_match = False
+                    if reconciliation_status != "PENDING_EXCHANGE_VERIFICATION":
+                        diff = abs(aggregate_remaining - real_amount)
 
-                                self._tracked_positions[trading_pair][side].append(
-                                    position_data
+                        # 1. Normal hassasiyet toleransı (sub-step precision rounding):
+                        # Bir tam qtyStep farkı ASLA normal precision toleransı sayılamaz.
+                        sub_step_precision = min(qty_step * Decimal("0.05"), Decimal("1e-6"))
+                        is_precision_match = (diff < qty_step) and (diff <= sub_step_precision or diff <= Decimal("1e-6"))
+
+                        reconciliation_verified = False
+                        reconciliation_status = "UNRESOLVED_DISCREPANCY"
+
+                    # Daha önce muhasebeleştirilmiş execution kimliklerini topla (çift düşmeyi önle)
+                    already_accounted_exec_ids = set()
+                    for p in active_saved:
+                        for aid in (p.get("accounted_exec_ids") or []):
+                            if aid:
+                                already_accounted_exec_ids.add(str(aid).strip())
+                        intent = p.get("tp1_intent")
+                        if isinstance(intent, dict):
+                            for aid in (intent.get("exec_ids") or []):
+                                if aid:
+                                    already_accounted_exec_ids.add(str(aid).strip())
+
+                    seen_exec_ids = set(already_accounted_exec_ids)
+
+                    # Her aktif parent için geçici kalan miktar haritası
+                    parent_remaining_map = {
+                        int(p.get("order_id", 0)): Decimal(str(p.get("remaining_amount", p.get("amount", 0))))
+                        for p in active_saved
+                    }
+
+                    if reconciliation_status == "PENDING_EXCHANGE_VERIFICATION":
+                        pass
+                    elif is_precision_match:
+                        # Tam veya sub-step float yuvarlama uyuşması:
+                        reconciliation_verified = True
+                        reconciliation_status = "VERIFIED_MATCH"
+                    elif aggregate_remaining > real_amount:
+                        # Kalan miktar borsadaki gerçek miktardan büyük:
+                        # Eksik bir kapanış gerçekleşmesi kanıtı aranır.
+                        # Yalnızca miktar toplamı eşleşmesi execution kanıtı SAYILAMAZ.
+                        # Kurallar:
+                        # 1. Geçerli execution kimliği, zaman ve yön bilgisi zorunlu (id/time normalizer alias'ları).
+                        #    Eksik/geçersiz metadata kaydı doğrulamasın.
+                        # 2. LONG kapanışı için SELL, SHORT kapanışı için BUY şartı açıkça denetlenir.
+                        #    reduceOnly tek başına ters yönü veya eksik yönü geçerli kılamaz; pozisyon etkisi de doğrulanır.
+                        # 3. Parent numarası alt dize araması kaldırılmıştır. Tam CID/order kimlik kaydı
+                        #    veya doğrulanmış parser eşlemesi kullanılır.
+                        # 4. Checkpoint çevresinde veya öncesinde zaten işlenmiş execution'ın yeniden düşülmesi önlenir.
+                        #    Daha önce muhasebeleştirilmiş kimliklerle tutarlı bir kez kontrolü yapılır.
+                        try:
+                            checkpoint_ts_raw = state_data.get("timestamp") or 0
+                            try:
+                                checkpoint_ts = float(checkpoint_ts_raw)
+                                if checkpoint_ts > 1e11:
+                                    checkpoint_ts = checkpoint_ts / 1000.0
+                            except (ValueError, TypeError):
+                                checkpoint_ts = 0.0
+
+                            if connector_obj is not None and hasattr(self, "_get_bybit_executions"):
+                                exec_rows = await self._get_bybit_executions(
+                                    connector_obj, trading_pair, limit=50
                                 )
-                                recovered_position_ids.add(int(position_data["order_id"]))
+                                expected_close_side = "SELL" if side == "LONG" else "BUY"
 
-                                # Faz 2 aktifse atomik sete de ekle — aksi halde
-                                # `_try_trigger_phase2`/monitor set'i boş görüp
-                                # yeniden aktivasyon deneyebilir.
-                                if position_data.get("phase2_active"):
+                                for ex_row in exec_rows or []:
+                                    if not isinstance(ex_row, dict):
+                                        continue
+
+                                    # execType filtresi: Funding/Adl/Bust trade sayılamaz
+                                    exec_type = str(ex_row.get("execType") or "Trade").strip()
+                                    if exec_type.lower() in ("funding", "adl", "bust"):
+                                        continue
+
+                                    # 1. Zorunlu metadata ve ID normalizer alias'ları:
+                                    raw_id = (
+                                        ex_row.get("id")
+                                        or ex_row.get("execId")
+                                        or ex_row.get("exId")
+                                        or ex_row.get("tradeId")
+                                    )
+                                    if raw_id is None:
+                                        continue
+                                    exec_id = str(raw_id).strip()
+                                    if not exec_id or exec_id in ("", "0", "None", "null", "undefined"):
+                                        continue
+
+                                    # Tekrar execution / daha önce muhasebeleştirilmiş kayıt kontrolü (bir kez kuralı):
+                                    if exec_id in seen_exec_ids:
+                                        continue
+
+                                    # Zorunlu zaman ve time normalizer alias'ları:
+                                    raw_time = (
+                                        ex_row.get("time")
+                                        or ex_row.get("execTime")
+                                        or ex_row.get("updatedTime")
+                                        or ex_row.get("timestamp")
+                                        or ex_row.get("transactTime")
+                                    )
+                                    if raw_time is None:
+                                        continue
                                     try:
-                                        self._phase2_active_positions.add(
-                                            int(position_data["order_id"])
-                                        )
+                                        ex_time_f = float(raw_time)
+                                        if ex_time_f <= 0.0 or ex_time_f != ex_time_f:
+                                            continue
+                                        if ex_time_f > 1e11:  # ms to seconds
+                                            ex_time_f = ex_time_f / 1000.0
+                                    except (ValueError, TypeError):
+                                        continue
+
+                                    # 4. Checkpoint öncesinde zaten işlenmiş execution reddedilir (zaman kontrolü):
+                                    if checkpoint_ts > 0.0 and ex_time_f <= checkpoint_ts:
+                                        continue
+
+                                    # 1 & 2. Zorunlu yön ve pozisyon etkisi denetimi:
+                                    raw_side = ex_row.get("side") or ex_row.get("orderSide")
+                                    if not raw_side:
+                                        continue
+                                    ex_side = str(raw_side).strip().upper()
+                                    if ex_side not in ("BUY", "SELL"):
+                                        continue
+
+                                    # LONG kapanışı için SELL, SHORT kapanışı için BUY şartı açıkça denetlenir.
+                                    # reduceOnly tek başına ters yönü (ör. LONG için BUY) asla geçerli kılamaz!
+                                    if ex_side != expected_close_side:
+                                        continue
+
+                                    # Pozisyon tarafı (positionSide/posSide) uyumluluğu doğrulanır:
+                                    pos_side = str(
+                                        ex_row.get("positionSide") or ex_row.get("posSide") or ""
+                                    ).strip().upper()
+                                    if pos_side and pos_side not in (side, "BOTH"):
+                                        continue
+
+                                    # Zorunlu miktar denetimi:
+                                    raw_qty = ex_row.get("qty") or ex_row.get("execQty") or ex_row.get("size")
+                                    if raw_qty is None:
+                                        continue
+                                    try:
+                                        exec_qty = Decimal(str(raw_qty))
+                                        if exec_qty <= Decimal("0"):
+                                            continue
                                     except Exception:
-                                        pass
+                                        continue
 
-                                # 💾 ARŞİVE KAYDET (docker restart persist)
-                                self._save_position_to_archive(position_data)
+                                    # 3. Hedef parent kimlik eşlemesi:
+                                    # Kural 2: current_attempt_cid, attempt_cids ve mevcut kimlik defteri üzerinden tam CID eşlemesi.
+                                    # Kural 3: Pipe-token yolunda ilk eşleşeni seçme; birden fazla parent adayı varsa belirsiz bırak.
+                                    # Kural 4: parent_id, order kimliği ve CID farklı parent'ları gösteriyorsa öncelik sırasıyla seçme; kaydı reddet.
 
-                                recovered_count += 1
+                                    cand_pid = None
+                                    cand_oid = None
+                                    cand_cid = None
 
-                                self.logger().info(
-                                    f"🔄 [RECOVERY] {trading_pair} {side} - "
-                                    f"Phase2: {saved_pos.get('phase2_active', False)}, "
-                                    f"1R: {saved_pos.get('1r_reached', False)}"
+                                    # a) Doğrudan parent_id alanı
+                                    raw_pid = ex_row.get("parent_id")
+                                    if raw_pid is not None:
+                                        try:
+                                            pid_cand = int(raw_pid)
+                                            if pid_cand in parent_remaining_map:
+                                                cand_pid = pid_cand
+                                        except (ValueError, TypeError):
+                                            pass
+
+                                    # b) Doğrudan parent orderId alanı / çocuk orderId
+                                    raw_oid = ex_row.get("orderId") or ex_row.get("order_id")
+                                    if raw_oid is not None:
+                                        try:
+                                            oid_cand = int(raw_oid)
+                                            if oid_cand in parent_remaining_map:
+                                                cand_oid = oid_cand
+                                        except (ValueError, TypeError):
+                                            pass
+                                        if cand_oid is None:
+                                            matched_oid_parents = set()
+                                            raw_oid_s = str(raw_oid).strip()
+                                            for p in active_saved:
+                                                pid = int(p.get("order_id", 0))
+                                                ledger_entry = getattr(self, "_position_identity_ledger", {}).get(pid) or {}
+                                                for ch_id in (ledger_entry.get("child_order_ids") or []):
+                                                    if str(ch_id).strip() == raw_oid_s:
+                                                        matched_oid_parents.add(pid)
+                                                s_ledger = (state_data.get("position_identity_ledger") or {}).get(str(pid)) or {}
+                                                for ch_id in (s_ledger.get("child_order_ids") or []):
+                                                    if str(ch_id).strip() == raw_oid_s:
+                                                        matched_oid_parents.add(pid)
+                                            if len(matched_oid_parents) == 1:
+                                                cand_oid = next(iter(matched_oid_parents))
+                                            elif len(matched_oid_parents) > 1:
+                                                cand_oid = -1  # Çelişkili orderId eşleşmesi
+
+                                    # c) CID eşlemesi (orderLinkId / clientOrderId / clOrdId)
+                                    cid_str = str(
+                                        ex_row.get("orderLinkId")
+                                        or ex_row.get("clientOrderId")
+                                        or ex_row.get("clOrdId")
+                                        or ""
+                                    ).strip()
+                                    if cid_str:
+                                        matched_cids = set()
+
+                                        # i. current_attempt_cid, attempt_cids ve kimlik defteri üzerinden tam CID eşlemesi:
+                                        for p in active_saved:
+                                            pid = int(p.get("order_id", 0))
+                                            intent = p.get("tp1_intent")
+                                            if isinstance(intent, dict):
+                                                curr_cid = str(intent.get("current_attempt_cid") or "").strip()
+                                                if curr_cid and curr_cid == cid_str:
+                                                    matched_cids.add(pid)
+                                                for att_cid in (intent.get("attempt_cids") or []):
+                                                    if str(att_cid).strip() == cid_str:
+                                                        matched_cids.add(pid)
+                                            ledger_entry = getattr(self, "_position_identity_ledger", {}).get(pid) or {}
+                                            for known_cid in (ledger_entry.get("cids") or []):
+                                                if str(known_cid).strip() == cid_str:
+                                                    matched_cids.add(pid)
+                                            s_ledger = (state_data.get("position_identity_ledger") or {}).get(str(pid)) or {}
+                                            for known_cid in (s_ledger.get("cids") or []):
+                                                if str(known_cid).strip() == cid_str:
+                                                    matched_cids.add(pid)
+
+                                        # ii. Dahili parser eşlemesi (_parse_cid - H-... / HB-... formatları):
+                                        if not matched_cids and hasattr(self, "_parse_cid"):
+                                            try:
+                                                parsed_cid = self._parse_cid(cid_str)
+                                                if isinstance(parsed_cid, dict) and parsed_cid.get("valid"):
+                                                    parsed_pid = parsed_cid.get("parent_id")
+                                                    if parsed_pid is not None and int(parsed_pid) in parent_remaining_map:
+                                                        matched_cids.add(int(parsed_pid))
+                                            except Exception:
+                                                pass
+
+                                        # iv. Pipe-token eşlemesi:
+                                        # Kural 3: İlk eşleşeni SEÇME. Birden fazla parent adayı varsa belirsiz bırak.
+                                        if not matched_cids and "|" in cid_str:
+                                            parts = [p.strip() for p in cid_str.split("|") if p.strip()]
+                                            pipe_matches = set()
+                                            for p_part in parts:
+                                                if p_part.isdigit() and int(p_part) in parent_remaining_map:
+                                                    pipe_matches.add(int(p_part))
+                                            if len(pipe_matches) == 1:
+                                                matched_cids.add(next(iter(pipe_matches)))
+                                            elif len(pipe_matches) > 1:
+                                                matched_cids.update(pipe_matches)
+
+                                        if len(matched_cids) == 1:
+                                            cand_cid = next(iter(matched_cids))
+                                        elif len(matched_cids) > 1:
+                                            cand_cid = -1  # İki veya daha fazla parent adayı içeren CID -> belirsiz
+
+                                    # Kural 4: parent_id, order kimliği ve CID farklı parent'ları gösteriyorsa öncelik sırasıyla seçme; kaydı reddet.
+                                    candidate_sources = [c for c in (cand_pid, cand_oid, cand_cid) if c is not None]
+                                    if not candidate_sources:
+                                        continue
+
+                                    # Eğer herhangi bir kaynak çelişki/belirsizlik bildirdiyse (-1):
+                                    if any(c == -1 for c in candidate_sources):
+                                        continue
+
+                                    # Farklı kaynaklar farklı parent gösteriyorsa (çelişen parent_id / CID):
+                                    distinct_parents = set(candidate_sources)
+                                    if len(distinct_parents) > 1:
+                                        continue
+
+                                    ex_pid = next(iter(distinct_parents))
+                                    if ex_pid not in parent_remaining_map:
+                                        continue
+
+                                    # e) Hedef parent'ın kalanını yalnız bir kez güncelle:
+                                    seen_exec_ids.add(exec_id)
+                                    cur_p_rem = parent_remaining_map[ex_pid]
+                                    applied_qty = min(cur_p_rem, exec_qty)
+                                    parent_remaining_map[ex_pid] = max(Decimal("0"), cur_p_rem - applied_qty)
+                                    if ex_pid not in matched_parent_execs:
+                                        matched_parent_execs[ex_pid] = []
+                                    matched_parent_execs[ex_pid].append({
+                                        "exec_id": exec_id,
+                                        "applied_qty": applied_qty,
+                                    })
+
+                                # Toplam parent kalanı borsa miktarıyla tutarlı olmadan normal yönetimi açma
+                                new_aggregate_remaining = sum(parent_remaining_map.values())
+                                remaining_diff = abs(new_aggregate_remaining - real_amount)
+                                is_reconciled_match = (remaining_diff < qty_step) and (
+                                    remaining_diff <= sub_step_precision or remaining_diff <= Decimal("1e-6")
+                                )
+
+                                if is_reconciled_match and matched_parent_execs:
+                                    reconciliation_verified = True
+                                    reconciliation_status = "EXPLAINED_BY_EXECUTION"
+                                    # Hedef parent'ların kalan miktarını ve accounted_exec_ids listesini muhasebeleştir
+                                    for p in active_saved:
+                                        pid = int(p.get("order_id", 0))
+                                        if pid in parent_remaining_map:
+                                            p["remaining_amount"] = parent_remaining_map[pid]
+                                        if pid in matched_parent_execs:
+                                            p_accounted = list(p.get("accounted_exec_ids") or [])
+                                            for rec in matched_parent_execs[pid]:
+                                                if rec["exec_id"] not in p_accounted:
+                                                    p_accounted.append(rec["exec_id"])
+                                            p["accounted_exec_ids"] = p_accounted
+                                    aggregate_remaining = new_aggregate_remaining
+                                    diff = remaining_diff
+                        except Exception as exec_err:
+                            self.logger().debug(f"[RECOVERY EXEC RECONCILE] {trading_pair}: {exec_err}")
+
+                    if not reconciliation_verified and reconciliation_status != "PENDING_EXCHANGE_VERIFICATION":
+                        self.logger().warning(
+                            f"⚠️ [RECOVERY MISMATCH] {trading_pair} {side} pozisyon miktarı uyuşmuyor: "
+                            f"Saved aggregate: {aggregate_remaining}, Real exchange: {real_amount}, "
+                            f"Diff: {diff} >= qtyStep: {qty_step}. "
+                            f"Açıklanmamış fark normal uzlaşma sayılmadı; belirsizlik korunuyor."
+                        )
+
+                    # Toplam kalan miktar uzlaştırma döngüsü:
+                    # - Uzlaştıysa (qtyStep içi veya kanıtlanmış gerçekleşme): Normal doğrulanmış recover edilir.
+                    # - Uzlaşmadıysa (belirsiz/açıklanmamış fark): Belirsizlik korunur;
+                    #   parent'lar kör FIFO veya oransal tahsisle değiştirilmez, mevcut borsa koruması
+                    #   iptal edilmesin diye state'e belirsiz/doğrulanmamış statüyle kaydedilir.
+                    for saved_pos in active_saved:
+                        # 🔥 FIX: Exchange name düzeltme ("testnet" → "binance_perpetual_testnet")
+                        exchange_name = saved_pos.get("exchange", "")
+                        if exchange_name == "testnet" or exchange_name == "":
+                            exchange_name = "binance_perpetual_testnet"
+                            self.logger().warning(
+                                f"⚠️ [STATE FIX] {trading_pair} {side} - "
+                                f"Exchange name 'testnet' → 'binance_perpetual_testnet' düzeltildi"
+                            )
+
+                        initial_sl_raw = saved_pos.get("initial_sl")
+                        if initial_sl_raw is None or str(initial_sl_raw) == "":
+                            initial_sl_raw = saved_pos.get("sl", "0")
+                        phase2_first_sl_raw = saved_pos.get("phase2_first_sl")
+                        if phase2_first_sl_raw is None or str(phase2_first_sl_raw) == "":
+                            phase2_first_sl_raw = initial_sl_raw
+
+                        # State'i recover et - tam yedek parent'ı ve root state yapısını koru
+                        position_data = dict(saved_pos)
+                        position_data.update({
+                            "order_id": saved_pos.get("order_id", 0),
+                            "exchange": exchange_name,  # Düzeltilmiş exchange name
+                            "trading_pair": trading_pair,
+                            "entry": Decimal(str(saved_pos["entry"])),
+                            "sl": Decimal(str(saved_pos["sl"])),
+                            "initial_sl": Decimal(str(initial_sl_raw)),
+                            "phase2_first_sl": Decimal(str(phase2_first_sl_raw)),
+                            "tp": Decimal(str(saved_pos["tp"])),
+                            "amount": Decimal(str(saved_pos["amount"])),
+                            "remaining_amount": Decimal(
+                                str(
+                                    saved_pos.get(
+                                        "remaining_amount", saved_pos["amount"]
+                                    )
+                                )
+                            ),
+                            "side": side,
+                            "risk": Decimal(str(saved_pos["risk"])),
+                            "1r_reached": saved_pos.get("1r_reached", False),
+                            "applied_cumulative_fill": dict(
+                                saved_pos.get("applied_cumulative_fill") or {}
+                            ),
+                            "applied_exec_ids": dict(
+                                saved_pos.get("applied_exec_ids") or {}
+                            ),
+                            "ws_fills_by_order": dict(
+                                saved_pos.get("ws_fills_by_order") or {}
+                            ),
+                            "phase2_active": saved_pos.get(
+                                "phase2_active", False
+                            ),
+                            # 🔒 FIX BQ-2: Faz 2'nin TAM durumu geri yüklenir.
+                            # Geriye uyum: eski dosyada activation_complete
+                            # yoksa phase2_active'e eşitlenir (aktivasyon
+                            # penceresi ~5 sn — kaydedilmiş bir phase2_active
+                            # pratikte hep tamamlanmış demektir).
+                            "phase2_activation_complete": bool(
+                                saved_pos.get(
+                                    "phase2_activation_complete",
+                                    saved_pos.get("phase2_active", False),
+                                )
+                            ),
+                            "phase2_tp_mode": str(
+                                saved_pos.get("phase2_tp_mode", "order")
+                                or "order"
+                            ),
+                            "phase2_tp2_done": bool(
+                                saved_pos.get("phase2_tp2_done", False)
+                            ),
+                            "phase2_tp2_in_progress": False,
+                            "exchange_order_id": saved_pos.get(
+                                "exchange_order_id"
+                            ),
+                            # 🎯 FIX BR: sinyal üçlüsü + R/R oranı geri
+                            # yüklenir (yoksa mevcut değerlere düşer →
+                            # eski state dosyalarıyla geriye uyumlu).
+                            "signal_entry": Decimal(
+                                str(
+                                    saved_pos.get("signal_entry")
+                                    or saved_pos["entry"]
+                                )
+                            ),
+                            "signal_tp": Decimal(
+                                str(
+                                    saved_pos.get("signal_tp")
+                                    or saved_pos["tp"]
+                                )
+                            ),
+                            # 🔀 FIX BV — RR2 state machine restore.
+                            "management_stage": str(
+                                saved_pos.get("management_stage") or ""
+                            ),
+                            "r_sl_baseline": Decimal(
+                                str(saved_pos.get("r_sl_baseline") or 0)
+                            ),
+                            "r1_price": Decimal(
+                                str(saved_pos.get("r1_price") or 0)
+                            ),
+                            "r2_price": Decimal(
+                                str(saved_pos.get("r2_price") or 0)
+                            ),
+                            "r3_price": Decimal(
+                                str(saved_pos.get("r3_price") or 0)
+                            ),
+                            "rr2_stop_placed_at": Decimal(
+                                str(saved_pos.get("rr2_stop_placed_at") or 0)
+                            ),
+                            "trailing_anchor_price": Decimal(
+                                str(saved_pos.get("trailing_anchor_price") or 0)
+                            ),
+                            "tp_suppressed_by_rr2": bool(
+                                saved_pos.get("tp_suppressed_by_rr2", False)
+                            ),
+                            "rr2_original_tp": Decimal(
+                                str(saved_pos.get("rr2_original_tp") or 0)
+                            ),
+                            "rr2_failclose_last_try": float(
+                                saved_pos.get("rr2_failclose_last_try") or 0
+                            ),
+                            "r_baseline_untrusted": bool(
+                                saved_pos.get("r_baseline_untrusted", False)
+                            ),
+                            "last_logged_sl": Decimal(
+                                str(
+                                    saved_pos.get(
+                                        "last_logged_sl", saved_pos["sl"]
+                                    )
+                                    or saved_pos["sl"]
+                                )
+                            ),
+                            "peak_price": Decimal(
+                                str(
+                                    saved_pos.get(
+                                        "peak_price", saved_pos["entry"]
+                                    )
+                                )
+                            ),
+                            "tp1_done": bool(saved_pos.get("tp1_done", False)),
+                            "be_05_done": bool(saved_pos.get("be_05_done", False)),
+                            "confirmed_sl": (
+                                Decimal(str(saved_pos.get("confirmed_sl")))
+                                if saved_pos.get("confirmed_sl") is not None
+                                else None
+                            ),
+                            "pending_target_sl": (
+                                Decimal(str(saved_pos.get("pending_target_sl")))
+                                if saved_pos.get("pending_target_sl") is not None
+                                else None
+                            ),
+                            "tp1_intent": saved_pos.get("tp1_intent"),
+                            # Belirsizlik ve uzlaştırma durum bayrakları:
+                            "reconciliation_verified": bool(reconciliation_verified),
+                            "reconciliation_status": str(reconciliation_status),
+                            "unresolved_qty_mismatch": bool(not reconciliation_verified),
+                            "discrepancy_amount": Decimal(str(diff)) if not reconciliation_verified else Decimal("0"),
+                            "exchange_real_amount": Decimal(str(real_amount)),
+                            "saved_aggregate_remaining": Decimal(str(aggregate_remaining)),
+                            "fifo_attribution_ambiguous": bool(
+                                (not reconciliation_verified) or saved_pos.get("fifo_attribution_ambiguous", False)
+                            ),
+                            "fifo_attribution_mismatch": bool(
+                                (not reconciliation_verified) or saved_pos.get("fifo_attribution_mismatch", False)
+                            ),
+                            "fifo_status": (
+                                "UNRESOLVED_QTY_MISMATCH"
+                                if (not reconciliation_verified)
+                                else str(saved_pos.get("fifo_status") or "")
+                            ),
+                            "accounted_exec_ids": list(saved_pos.get("accounted_exec_ids") or []),
+                            "timestamp": self.current_timestamp,
+                        })
+                        if position_data.get("position_idx") is None and "bybit" in str(exchange_name).lower():
+                            position_data["position_idx"] = 1 if side == "LONG" else 2
+
+                        # r_distance_orig: yalnızca >0 ise anahtar konur —
+                        # 0 ile konursa `_try_trigger_phase2` "zaten var"
+                        # sanıp orijinal mesafeyi bir daha sabitlemez.
+                        try:
+                            _rdo_saved = saved_pos.get("r_distance_orig")
+                            if _rdo_saved and float(_rdo_saved) > 0:
+                                position_data["r_distance_orig"] = Decimal(
+                                    str(_rdo_saved)
+                                )
+                            _ree_saved = saved_pos.get("r_eff_entry")
+                            if _ree_saved and float(_ree_saved) > 0:
+                                position_data["r_eff_entry"] = Decimal(
+                                    str(_ree_saved)
+                                )
+                            # 🎯 FIX BR: rr_target yoksa sinyal üçlüsünden
+                            # yeniden türetilir (eski state dosyaları).
+                            _rr_saved = saved_pos.get("rr_target")
+                            if _rr_saved and float(_rr_saved) > 0:
+                                position_data["rr_target"] = Decimal(
+                                    str(_rr_saved)
                                 )
                             else:
-                                self.logger().warning(
-                                    f"⚠️ [RECOVERY] {trading_pair} {side} pozisyon miktarı uyuşmuyor: "
-                                    f"Saved: {saved_amount}, Real: {real_amount}"
+                                position_data["rr_target"] = self._signal_rr(
+                                    side,
+                                    position_data.get("signal_entry"),
+                                    position_data.get("initial_sl"),
+                                    position_data.get("signal_tp"),
                                 )
-                        else:
+                        except Exception:
+                            pass
+
+                        if position_data["remaining_amount"] <= Decimal("0"):
                             self.logger().info(
-                                f"ℹ️ [RECOVERY] {trading_pair} {side} pozisyonu artık yok (kapatılmış)"
+                                f"ℹ️ [RECOVERY PRUNE] {trading_pair} {side} #{position_data['order_id']} - "
+                                f"remaining_amount <= 0, state'e geri alınmadı"
                             )
-                            # ⚠️ ARŞİVDEN SİLME! FAZ 2 partial close'da Binance'de görünmeyebilir
+                            continue
+
+                        if str(position_data.get("management_stage") or "") == "RR2_ARMED_R1":
+                            position_data["management_stage"] = "RR2_TRAIL_2R"
+                            if not position_data.get("trailing_anchor_price"):
+                                position_data["trailing_anchor_price"] = (
+                                    position_data.get("rr2_stop_placed_at")
+                                    or position_data.get("sl")
+                                )
+                            self.logger().warning(
+                                f"🔄 [RR2 LOAD MIGRATE] {trading_pair} {side} #{position_data.get('order_id')} - "
+                                f"Eski 'RR2_ARMED_R1' aşaması tespit edildi → 'RR2_TRAIL_2R' olarak güncellendi "
+                                f"(anchor={position_data.get('trailing_anchor_price')})"
+                            )
+
+                        self._tracked_positions[trading_pair][side].append(
+                            position_data
+                        )
+                        recovered_position_ids.add(int(position_data["order_id"]))
+
+                        # Faz 2 aktifse atomik sete de ekle — aksi halde
+                        # `_try_trigger_phase2`/monitor set'i boş görüp
+                        # yeniden aktivasyon deneyebilir.
+                        if position_data.get("phase2_active"):
+                            try:
+                                self._phase2_active_positions.add(
+                                    int(position_data["order_id"])
+                                )
+                            except Exception:
+                                pass
+
+                        # 💾 ARŞİVE KAYDET (docker restart persist)
+                        self._save_position_to_archive(position_data)
+
+                        if reconciliation_verified:
+                            recovered_count += 1
+                        else:
+                            self.logger().warning(
+                                f"⚠️ [RECOVERY UNVERIFIED] {trading_pair} {side} #{position_data.get('order_id')} - "
+                                f"Uzlaştırılmamış miktar farkı ile yüklendi (koruma muhafaza edildi, belirsizlik korundu)"
+                            )
+
+                        self.logger().info(
+                            f"🔄 [RECOVERY] {trading_pair} {side} - "
+                            f"Phase2: {saved_pos.get('phase2_active', False)}, "
+                            f"1R: {saved_pos.get('1r_reached', False)}"
+                        )
 
             # 🧮 PER-FILL ACCUMULATORS - FIFO fill bilgilerini yükle
             for key, acc_data in state_data.get("per_fill_accumulators", {}).items():
@@ -36866,9 +38296,41 @@ class TVSignalStrategy(ScriptStrategyBase):
             # (örn. exception yolunda) bot bir daha hiç state yazamazdı.
             self._state_loaded = True
 
+    def _is_exchange_snapshot_verified(self, exchange_name: Optional[str] = None) -> bool:
+        """
+        Doğrulanmış pozisyon snapshot'ı kontrolü (üretici/set/reset kanonik yolu).
+        Koşullar:
+        1. İlgili connector (veya tüm connector'lar) ready olmalı.
+        2. Son REST pozisyon sorgusu başarılı (retCode 0 / HTTP 200) olarak tamamlanmış olmalı.
+        3. Snapshot verisi TTL aşımına uğramamış (taze) olmalı.
+        """
+        try:
+            connectors = getattr(self, "connectors", {}) or {}
+            if exchange_name:
+                conn = connectors.get(exchange_name)
+                if not conn or not getattr(conn, "ready", False):
+                    return False
+            else:
+                if not connectors or not all(getattr(conn, "ready", False) for conn in connectors.values()):
+                    return False
+
+            if not getattr(self, "_positions_snapshot_verified", False):
+                return False
+
+            ttl = float(getattr(self, "BYBIT_POS_CACHE_TTL", 30.0) or 30.0)
+            max_age = max(ttl * 2.0, 30.0)
+            now = time.time()
+            last_ts = float(getattr(self, "_positions_snapshot_last_ts", 0.0) or 0.0)
+            if last_ts <= 0.0 or (now - last_ts) > max_age:
+                return False
+
+            return True
+        except Exception:
+            return False
+
     async def _fetch_real_positions(self) -> Dict[str, Dict[str, Any]]:
         """
-        ✅ MULTI-POSITION: Binance'den gerçek pozisyonları çek (recovery için)
+        ✅ MULTI-POSITION: Binance/Bybit'ten gerçek pozisyonları çek (recovery için)
         Return format: {trading_pair_side: {amount, side}}
         """
         positions = {}
@@ -36878,19 +38340,39 @@ class TVSignalStrategy(ScriptStrategyBase):
                 if not connector:
                     continue
 
-                # Tüm pozisyonları al
-                if hasattr(connector, "account_positions"):
-                    for pos_key, position in connector.account_positions.items():
-                        trading_pair = str(pos_key)
-                        amount = getattr(position, "amount", Decimal("0"))
-
-                        if abs(amount) > 0:
-                            side = "LONG" if amount > 0 else "SHORT"
-                            # ✅ Unique key: trading_pair_side
-                            positions[f"{trading_pair}_{side}"] = {
+                # 1. Stratejinin doğrulanmış pozisyon önbelleği (REST/WS ile beslenen kanonik kaynak)
+                pos_cache = getattr(self, "_binance_positions_cache", {}) or {}
+                for cache_key, pos_data in pos_cache.items():
+                    amount = Decimal(str(pos_data.get("amount", 0)))
+                    if abs(amount) > 0:
+                        side = pos_data.get("side") or ("LONG" if amount > 0 else "SHORT")
+                        parts = cache_key.rsplit("_", 1)
+                        if len(parts) == 2:
+                            positions[f"{parts[0]}_{parts[1]}"] = {
                                 "amount": amount,
                                 "side": side,
                             }
+
+                # 2. Connector account_positions (Hedge Mode key safe decoding)
+                if hasattr(connector, "account_positions"):
+                    for pos_key, position in connector.account_positions.items():
+                        amount = getattr(position, "amount", Decimal("0"))
+                        if abs(amount) > 0:
+                            tp = getattr(position, "trading_pair", None)
+                            if not tp:
+                                tp = str(pos_key)
+                                for s in ("SHORT", "LONG", "Short", "Long"):
+                                    if tp.endswith(s):
+                                        tp = tp[:-len(s)]
+                                        break
+                            pos_side = getattr(position, "position_side", None)
+                            side = getattr(pos_side, "name", None) if pos_side else ("LONG" if amount > 0 else "SHORT")
+                            norm_key = f"{tp}_{side}"
+                            if norm_key not in positions:
+                                positions[norm_key] = {
+                                    "amount": amount,
+                                    "side": side,
+                                }
 
         except Exception as e:
             self.logger().error(
@@ -37342,75 +38824,99 @@ class TVSignalStrategy(ScriptStrategyBase):
                         is_auth_required=True,
                         trading_pair=anchor_pair,
                     )
-                    rest_ok = True
-
+                    parse_ok = False
                     rows = []
                     if isinstance(resp, dict):
                         ret = resp.get("retCode", resp.get("ret_code", 0))
                         if str(ret) not in ("0", "None") and ret not in (0, None):
+                            rest_ok = False
                             try:
                                 self.logger().warning(
                                     f"BYBIT POS REST ret={ret} msg={resp.get('retMsg') or resp.get('ret_msg')}"
                                 )
                             except Exception:
                                 pass
-                        result = resp.get("result") or {}
-                        rows = result.get("list") or []
-                        if not rows and isinstance(resp.get("list"), list):
-                            rows = resp["list"]
-                    elif isinstance(resp, list):
-                        rows = resp
-
-                    for pos in rows or []:
-                        if not isinstance(pos, dict):
-                            continue
-                        try:
-                            size = Decimal(str(pos.get("size") or 0))
-                        except Exception:
-                            size = Decimal("0")
-                        if size == 0:
-                            continue
-
-                        side_raw = (pos.get("side") or "").strip()
-                        # Bybit: "Buy" / "Sell"
-                        if side_raw in ("Buy", "buy", "LONG", "Long"):
-                            side = "LONG"
-                            signed = abs(size)
-                        elif side_raw in ("Sell", "sell", "SHORT", "Short"):
-                            side = "SHORT"
-                            signed = -abs(size)
                         else:
-                            continue
+                            rest_ok = True
+                            result = resp.get("result") or {}
+                            rows = result.get("list") or []
+                            if not rows and isinstance(resp.get("list"), list):
+                                rows = resp["list"]
+                    elif isinstance(resp, list):
+                        rest_ok = True
+                        rows = resp
+                    else:
+                        rest_ok = False
 
-                        symbol = pos.get("symbol") or ""
-                        tp = None
-                        try:
-                            tp = await connector.trading_pair_associated_to_exchange_symbol(
-                                symbol
-                            )
-                        except Exception:
-                            if symbol.endswith("USDT") and "-" not in symbol:
-                                tp = f"{symbol[:-4]}-USDT"
+                    if rest_ok:
+                        parse_ok = True
+                        for pos in rows or []:
+                            if not isinstance(pos, dict):
+                                continue
+                            raw_size = pos.get("size")
+                            if raw_size is None or str(raw_size).strip() in ("", "0", "0.0"):
+                                continue
+                            try:
+                                size = Decimal(str(raw_size))
+                            except Exception:
+                                parse_ok = False
+                                rest_ok = False
+                                break
+                            if size == Decimal("0"):
+                                continue
+
+                            side_raw = (pos.get("side") or "").strip()
+                            # Bybit: "Buy" / "Sell"
+                            if side_raw in ("Buy", "buy", "LONG", "Long"):
+                                side = "LONG"
+                                signed = abs(size)
+                            elif side_raw in ("Sell", "sell", "SHORT", "Short"):
+                                side = "SHORT"
+                                signed = -abs(size)
                             else:
-                                tp = symbol.replace("USDT", "-USDT") if symbol else None
-                        if not tp:
-                            continue
+                                parse_ok = False
+                                rest_ok = False
+                                break
 
-                        try:
-                            entry_d = Decimal(
-                                str(pos.get("avgPrice") or pos.get("entryPrice") or 0)
-                            )
-                        except Exception:
-                            entry_d = Decimal("0")
+                            symbol = pos.get("symbol") or ""
+                            if not symbol:
+                                parse_ok = False
+                                rest_ok = False
+                                break
 
-                        new_cache[f"{tp}_{side}"] = {
-                            "amount": signed,
-                            "side": side,
-                            "trading_pair": tp,
-                            "entry": entry_d,
-                        }
+                            tp = None
+                            try:
+                                tp = await connector.trading_pair_associated_to_exchange_symbol(
+                                    symbol
+                                )
+                            except Exception:
+                                if symbol.endswith("USDT") and "-" not in symbol:
+                                    tp = f"{symbol[:-4]}-USDT"
+                                else:
+                                    tp = symbol.replace("USDT", "-USDT") if symbol else None
+                            if not tp:
+                                parse_ok = False
+                                rest_ok = False
+                                break
+
+                            try:
+                                entry_raw = pos.get("avgPrice") or pos.get("entryPrice") or 0
+                                entry_d = Decimal(str(entry_raw))
+                            except Exception:
+                                parse_ok = False
+                                rest_ok = False
+                                break
+
+                            new_cache[f"{tp}_{side}"] = {
+                                "amount": signed,
+                                "side": side,
+                                "trading_pair": tp,
+                                "entry": entry_d,
+                            }
 
                 except TypeError as te:
+                    rest_ok = False
+                    parse_ok = False
                     try:
                         self.logger().warning(
                             f"BYBIT POS REST TypeError ({reason}): {te} — tierA/empty"
@@ -37418,15 +38924,18 @@ class TVSignalStrategy(ScriptStrategyBase):
                     except Exception:
                         pass
                 except Exception as e:
+                    rest_ok = False
+                    parse_ok = False
                     try:
                         self.logger().warning(f"BYBIT POS REST failed ({reason}): {e}")
                     except Exception:
                         pass
 
-                # REST TAMAMEN başarısız → son çare olarak HB görüntüsü.
-                # (REST başarılı ve boş ise "0 open" DOĞRU cevaptır; HB'nin hayalet
-                #  pozisyonlarıyla üzerine yazmak tam olarak §16'daki salınımı üretir.)
-                if not rest_ok:
+                # REST veya parse başarısız ise: snapshot doğrulanmamış kalmalı,
+                # kısmi / bozuk new_cache asla committed edilmemeli!
+                if not rest_ok or not parse_ok:
+                    self._positions_snapshot_verified = False
+                    self._positions_snapshot_last_ts = 0.0
                     fallback = hb_tier_a or self._sync_from_hummingbot_cache(connector)
                     if fallback:
                         self.logger().warning(
@@ -37436,12 +38945,15 @@ class TVSignalStrategy(ScriptStrategyBase):
                         )
                         self._binance_positions_cache = fallback
                         self._binance_positions_last_fetch = time.time()
+                        # Fallback/kısmi veri hiçbir zaman doğrulanmış snapshot etiketi almasın!
                         return True
-                    if not new_cache:
-                        return False
+                    return False
 
+                # Yalnız başarılı ve eksiksiz parse edilmiş API cevabı doğrulanmış snapshot olur:
                 self._binance_positions_cache = new_cache
                 self._binance_positions_last_fetch = time.time()
+                self._positions_snapshot_verified = True
+                self._positions_snapshot_last_ts = self._binance_positions_last_fetch
 
                 # 🔇 FIX AA: SADECE DURUM DEĞİŞİKLİĞİNDE logla.
                 # Eskiden `force=True` ile gelen her çağrı INFO basıyordu; tek bir
