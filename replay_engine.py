@@ -1,171 +1,297 @@
+"""
+Deterministic Replay Engine for Hummingbot TV Signal Strategy Audit
+Replays exact strategy rules on 1-minute LastPrice and MarkPrice Bybit klines.
+Fully self-contained: loads data from data/ directory.
+"""
+
+import os
 import json
 import csv
 import sys
+import argparse
 from datetime import datetime, timezone
+from collections import defaultdict
 
-sys.stdout.reconfigure(encoding='utf-8')
+def parse_args():
+    parser = argparse.ArgumentParser(description="Deterministic Strategy Replay Engine")
+    parser.add_argument("--mode", choices=["pessimistic", "optimistic"], default="pessimistic",
+                        help="Intra-candle tie-breaker mode for same-bar TP1/SL conflict")
+    parser.add_argument("--with-4h-timeout", action="store_true", default=False,
+                        help="Enable artificial 4-hour timeout (sensitivity test only)")
+    parser.add_argument("--taker-fee", type=float, default=0.00055,
+                        help="Exchange taker fee per side (default 0.055%)")
+    parser.add_argument("--maker-fee", type=float, default=0.00020,
+                        help="Exchange maker fee per side for TP1 limit orders (default 0.020%)")
+    parser.add_argument("--output-csv", type=str, default=None,
+                        help="Optional CSV output path for per-parent replay results")
+    return parser.parse_args()
 
-with open('scratch/klines/PONSUSDT_last_1m.json', 'r', encoding='utf-8') as f:
-    pons_klines = {int(k[0]): k for k in json.load(f)}
+def run_replay(mode="pessimistic", with_4h_timeout=False, taker_fee=0.00055, maker_fee=0.00020):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(base_dir, 'data')
 
-with open('scratch/klines/CHIPUSDT_last_1m.json', 'r', encoding='utf-8') as f:
-    chip_klines = {int(k[0]): k for k in json.load(f)}
+    # Load klines from data/klines
+    kline_dir = os.path.join(data_dir, 'klines')
+    with open(os.path.join(kline_dir, 'PONSUSDT_last_1m.json'), 'r', encoding='utf-8') as f:
+        pons_last = {int(k[0]): k for k in json.load(f)}
+    with open(os.path.join(kline_dir, 'PONSUSDT_mark_1m.json'), 'r', encoding='utf-8') as f:
+        pons_mark = {int(k[0]): k for k in json.load(f)}
+    with open(os.path.join(kline_dir, 'CHIPUSDT_last_1m.json'), 'r', encoding='utf-8') as f:
+        chip_last = {int(k[0]): k for k in json.load(f)}
+    with open(os.path.join(kline_dir, 'CHIPUSDT_mark_1m.json'), 'r', encoding='utf-8') as f:
+        chip_mark = {int(k[0]): k for k in json.load(f)}
 
-# Load complete cohort parents from parse_all_parents_complete
-sys.path.append('scratch')
-from parse_all_parents_complete import valid_cohort_parents
+    # Load cohort parents from data/cohort_parents.json
+    parents_file = os.path.join(data_dir, 'cohort_parents.json')
+    with open(parents_file, 'r', encoding='utf-8') as f:
+        cohort_parents = json.load(f)
 
-tick_sizes = {'CHIPUSDT': 0.00001, 'PONSUSDT': 0.0001}
-
-def run_replay(mode='pessimistic'):
+    tick_sizes = {'CHIPUSDT': 0.00001, 'PONSUSDT': 0.0001}
     results = {}
-    for pid, p in valid_cohort_parents.items():
+    ambiguity_count = 0
+
+    for pid, p in cohort_parents.items():
         sym = p['symbol']
         side = p['side']
-        entry_px = p['entry_price']
-        entry_qty = p['entry_qty']
-        baseline_sl = p['baseline_sl']
-        r1 = p['r1']
-        r2 = p['r2']
-        r3 = p['r3']
+        entry_px = float(p['entry_price'])
+        entry_qty = float(p['entry_qty'])
+        baseline_sl = float(p['baseline_sl'])
+        r1 = float(p['r1'])
+        r2 = float(p['r2'])
+        r3 = float(p['r3'])
+        r_dist = abs(entry_px - baseline_sl)
         tick = tick_sizes[sym]
-        start_ts = int(p['dt'].timestamp() * 1000)
-        
-        # 4 hours window max
-        end_ts = start_ts + 4 * 3600 * 1000
-        kline_dict = pons_klines if 'PONS' in sym else chip_klines
-        bars = [k for ts, k in sorted(kline_dict.items()) if start_ts <= ts <= end_ts]
-        
-        if not bars or entry_px <= 0 or baseline_sl <= 0:
-            results[pid] = {'pnl': 0.0, 'tp1_hit': False, 'close_reason': 'NO_DATA'}
+        start_ts = int(p['timestamp_ms'])
+
+        last_dict = pons_last if 'PONS' in sym else chip_last
+        mark_dict = pons_mark if 'PONS' in sym else chip_mark
+
+        common_ts = sorted([ts for ts in last_dict if ts >= start_ts and ts in mark_dict])
+        if not common_ts or entry_px <= 0 or baseline_sl <= 0:
+            results[pid] = {
+                'parent_id': pid, 'symbol': sym, 'side': side, 'entry_price': entry_px, 'qty': entry_qty,
+                'status': 'NO_DATA', 'gross_pnl': 0.0, 'fees_paid': 0.0, 'net_pnl': 0.0, 'tp1_hit': False,
+                'close_reason': 'NO_DATA', 'bars_held': 0
+            }
             continue
-        
+
         rem_qty = entry_qty
-        realized_pnl = 0.0
+        gross_pnl = 0.0
+        fees_paid = entry_qty * entry_px * taker_fee  # Entry taker fee
         tp1_hit = False
         current_sl = baseline_sl
         peak_px = entry_px
         closed = False
         close_reason = ''
-        
-        for bar in bars:
-            b_high = float(bar[2])
-            b_low = float(bar[3])
-            b_close = float(bar[4])
-            
+        close_ts = None
+        bars_held = 0
+        experienced_ambiguity = False
+
+        for idx, ts in enumerate(common_ts):
+            bars_held += 1
+            l_bar = last_dict[ts]
+            m_bar = mark_dict[ts]
+
+            l_open, l_high, l_low, l_close = float(l_bar[1]), float(l_bar[2]), float(l_bar[3]), float(l_bar[4])
+            m_open, m_high, m_low, m_close = float(m_bar[1]), float(m_bar[2]), float(m_bar[3]), float(m_bar[4])
+
+            # Optional 4-hour exit check
+            if with_4h_timeout and bars_held >= 240:
+                exit_px = l_close
+                gross_pnl += rem_qty * ((exit_px - entry_px) if side == 'LONG' else (entry_px - exit_px))
+                fees_paid += rem_qty * exit_px * taker_fee
+                closed = True
+                close_reason = 'TIMEOUT_4H'
+                close_ts = ts
+                break
+
             if side == 'LONG':
-                # Check ambiguity: Does bar touch both current_sl and r1 (if not tp1_hit)?
-                ambiguous_tp1 = (not tp1_hit and b_low <= current_sl and b_high >= r1)
-                
-                if ambiguous_tp1:
-                    if mode == 'pessimistic':
-                        # SL hit first!
-                        realized_pnl += rem_qty * (current_sl - entry_px)
+                # Triggered by MarkPrice!
+                mark_hits_sl = (m_low <= current_sl)
+                last_hits_tp1 = (l_high >= r1) if not tp1_hit else False
+
+                if mark_hits_sl and last_hits_tp1 and not tp1_hit:
+                    experienced_ambiguity = True
+                    ambiguity_count += 1
+
+                if mode == 'pessimistic':
+                    # Pessimistic: SL checked first
+                    if mark_hits_sl:
+                        exit_px = min(current_sl, l_low)
+                        gross_pnl += rem_qty * (exit_px - entry_px)
+                        fees_paid += rem_qty * exit_px * taker_fee
                         closed = True
-                        close_reason = 'SL_HIT_BEFORE_TP1'
+                        close_reason = 'SL_TRIGGERED'
+                        close_ts = ts
                         break
-                    else:
-                        # TP1 hit first!
-                        tp_qty = round(entry_qty * 0.5, 0 if sym == 'CHIPUSDT' else 1)
-                        realized_pnl += tp_qty * (r1 - entry_px)
-                        rem_qty -= tp_qty
+
+                    if last_hits_tp1:
                         tp1_hit = True
-                        current_sl = max(current_sl, entry_px) # Move to BE
-                        # Then in same bar, did it also hit BE?
-                        if b_low <= current_sl:
-                            realized_pnl += rem_qty * (current_sl - entry_px)
+                        tp_qty = round(entry_qty * 0.5, 0 if sym == 'CHIPUSDT' else 1)
+                        gross_pnl += tp_qty * (r1 - entry_px)
+                        fees_paid += tp_qty * r1 * maker_fee  # Limit maker fee
+                        rem_qty -= tp_qty
+                        current_sl = max(current_sl, entry_px)  # Move to BE
+                        # If same bar also breaches BE
+                        if m_low <= current_sl:
+                            exit_px = min(current_sl, l_low)
+                            gross_pnl += rem_qty * (exit_px - entry_px)
+                            fees_paid += rem_qty * exit_px * taker_fee
                             closed = True
                             close_reason = 'TP1_THEN_BE_SAME_BAR'
+                            close_ts = ts
                             break
-                        continue
-                
-                # Normal SL check
-                if b_low <= current_sl:
-                    realized_pnl += rem_qty * (current_sl - entry_px)
-                    closed = True
-                    close_reason = 'SL_TRIGGERED'
-                    break
-                
-                if b_high > peak_px:
-                    peak_px = b_high
-                
-                # TP1 check
-                if not tp1_hit and b_high >= r1:
-                    tp1_hit = True
-                    tp_qty = round(entry_qty * 0.5, 0 if sym == 'CHIPUSDT' else 1)
-                    realized_pnl += tp_qty * (r1 - entry_px)
-                    rem_qty -= tp_qty
-                    current_sl = max(current_sl, entry_px)
-                
-                # 2R trailing ratchet check (Quantized correctly!)
-                if tp1_hit and b_high >= r2:
+                else:
+                    # Optimistic: TP1 checked first
+                    if last_hits_tp1:
+                        tp1_hit = True
+                        tp_qty = round(entry_qty * 0.5, 0 if sym == 'CHIPUSDT' else 1)
+                        gross_pnl += tp_qty * (r1 - entry_px)
+                        fees_paid += tp_qty * r1 * maker_fee
+                        rem_qty -= tp_qty
+                        current_sl = max(current_sl, entry_px)
+                    elif mark_hits_sl:
+                        exit_px = min(current_sl, l_low)
+                        gross_pnl += rem_qty * (exit_px - entry_px)
+                        fees_paid += rem_qty * exit_px * taker_fee
+                        closed = True
+                        close_reason = 'SL_TRIGGERED'
+                        close_ts = ts
+                        break
+
+                # Trailing updates on Last Price high
+                if l_high > peak_px:
+                    peak_px = l_high
+
+                if tp1_hit and l_high >= r2:
                     peak_pct = ((peak_px - entry_px) / entry_px) * 100
                     level = int(peak_pct // 0.2)
                     cand_sl = entry_px * (1 + (level * 0.001))
                     cand_sl_q = round(round(cand_sl / tick) * tick, 5 if sym == 'CHIPUSDT' else 4)
-                    if peak_px >= r3:
-                        cand_sl_q = max(cand_sl_q, r2)
+                    if peak_px >= r3 and r_dist > 0:
+                        k_peak = min(int((peak_px - entry_px) // r_dist), 11)
+                        floor = entry_px + (k_peak - 1) * r_dist if k_peak >= 3 else 0
+                        cand_sl_q = max(cand_sl_q, floor, r2)
                     current_sl = max(current_sl, cand_sl_q)
-                    
-            else: # SHORT
-                ambiguous_tp1 = (not tp1_hit and b_high >= current_sl and b_low <= r1)
-                if ambiguous_tp1:
-                    if mode == 'pessimistic':
-                        realized_pnl += rem_qty * (entry_px - current_sl)
+
+            else:  # SHORT
+                mark_hits_sl = (m_high >= current_sl)
+                last_hits_tp1 = (l_low <= r1) if not tp1_hit else False
+
+                if mark_hits_sl and last_hits_tp1 and not tp1_hit:
+                    experienced_ambiguity = True
+                    ambiguity_count += 1
+
+                if mode == 'pessimistic':
+                    if mark_hits_sl:
+                        exit_px = max(current_sl, l_high)
+                        gross_pnl += rem_qty * (entry_px - exit_px)
+                        fees_paid += rem_qty * exit_px * taker_fee
                         closed = True
-                        close_reason = 'SL_HIT_BEFORE_TP1'
+                        close_reason = 'SL_TRIGGERED'
+                        close_ts = ts
                         break
-                    else:
-                        tp_qty = round(entry_qty * 0.5, 0 if sym == 'CHIPUSDT' else 1)
-                        realized_pnl += tp_qty * (entry_px - r1)
-                        rem_qty -= tp_qty
+
+                    if last_hits_tp1:
                         tp1_hit = True
+                        tp_qty = round(entry_qty * 0.5, 0 if sym == 'CHIPUSDT' else 1)
+                        gross_pnl += tp_qty * (entry_px - r1)
+                        fees_paid += tp_qty * r1 * maker_fee
+                        rem_qty -= tp_qty
                         current_sl = min(current_sl, entry_px)
-                        if b_high >= current_sl:
-                            realized_pnl += rem_qty * (entry_px - current_sl)
+                        if m_high >= current_sl:
+                            exit_px = max(current_sl, l_high)
+                            gross_pnl += rem_qty * (entry_px - exit_px)
+                            fees_paid += rem_qty * exit_px * taker_fee
                             closed = True
                             close_reason = 'TP1_THEN_BE_SAME_BAR'
+                            close_ts = ts
                             break
-                        continue
-                
-                if b_high >= current_sl:
-                    realized_pnl += rem_qty * (entry_px - current_sl)
-                    closed = True
-                    close_reason = 'SL_TRIGGERED'
-                    break
-                
-                if b_low < peak_px:
-                    peak_px = b_low
-                
-                if not tp1_hit and b_low <= r1:
-                    tp1_hit = True
-                    tp_qty = round(entry_qty * 0.5, 0 if sym == 'CHIPUSDT' else 1)
-                    realized_pnl += tp_qty * (entry_px - r1)
-                    rem_qty -= tp_qty
-                    current_sl = min(current_sl, entry_px)
-                
-                if tp1_hit and b_low <= r2:
+                else:
+                    if last_hits_tp1:
+                        tp1_hit = True
+                        tp_qty = round(entry_qty * 0.5, 0 if sym == 'CHIPUSDT' else 1)
+                        gross_pnl += tp_qty * (entry_px - r1)
+                        fees_paid += tp_qty * r1 * maker_fee
+                        rem_qty -= tp_qty
+                        current_sl = min(current_sl, entry_px)
+                    elif mark_hits_sl:
+                        exit_px = max(current_sl, l_high)
+                        gross_pnl += rem_qty * (entry_px - exit_px)
+                        fees_paid += rem_qty * exit_px * taker_fee
+                        closed = True
+                        close_reason = 'SL_TRIGGERED'
+                        close_ts = ts
+                        break
+
+                if l_low < peak_px:
+                    peak_px = l_low
+
+                # FIXED SHORT 3R AND RATCHET FLOOR LOGIC
+                if tp1_hit and l_low <= r2:
                     peak_pct = ((entry_px - peak_px) / entry_px) * 100
                     level = int(peak_pct // 0.2)
                     cand_sl = entry_px * (1 - (level * 0.001))
                     cand_sl_q = round(round(cand_sl / tick) * tick, 5 if sym == 'CHIPUSDT' else 4)
-                    if peak_px >= r3:
-                        cand_sl_q = min(cand_sl_q, r2)
+                    if peak_px <= r3 and r_dist > 0:
+                        k_peak = min(int((entry_px - peak_px) // r_dist), 11)
+                        floor = entry_px - (k_peak - 1) * r_dist if k_peak >= 3 else 0
+                        cands = [c for c in (floor, cand_sl_q, r2) if c > 0]
+                        cand_sl_q = min(cands)
                     current_sl = min(current_sl, cand_sl_q)
-        
+
         if not closed:
-            last_px = float(bars[-1][4])
-            realized_pnl += rem_qty * (last_px - entry_px if side == 'LONG' else entry_px - last_px)
-            close_reason = 'TIMEOUT_4H'
-            
-        results[pid] = {'pnl': realized_pnl, 'tp1_hit': tp1_hit, 'close_reason': close_reason}
-    return results
+            final_bar = last_dict[common_ts[-1]]
+            final_px = float(final_bar[4])
+            gross_pnl += rem_qty * ((final_px - entry_px) if side == 'LONG' else (entry_px - final_px))
+            fees_paid += rem_qty * final_px * taker_fee
+            close_reason = 'OPEN_AT_END'
+            close_ts = common_ts[-1]
 
-pessimistic = run_replay('pessimistic')
-optimistic = run_replay('optimistic')
+        net_pnl = gross_pnl - fees_paid
+        results[pid] = {
+            'parent_id': pid,
+            'symbol': sym,
+            'side': side,
+            'entry_price': entry_px,
+            'qty': entry_qty,
+            'status': 'CLOSED' if closed else 'OPEN_AT_END',
+            'close_reason': close_reason,
+            'tp1_hit': tp1_hit,
+            'gross_pnl': gross_pnl,
+            'fees_paid': fees_paid,
+            'net_pnl': net_pnl,
+            'bars_held': bars_held,
+            'experienced_ambiguity': experienced_ambiguity,
+            'final_sl': current_sl
+        }
 
-tot_pess = sum(r['pnl'] for r in pessimistic.values())
-tot_opt = sum(r['pnl'] for r in optimistic.values())
+    return results, ambiguity_count
 
-print(f"\nReplay PnL Pessimistic (SL first on ambiguity): {tot_pess:+8.4f} USDT")
-print(f"Replay PnL Optimistic (TP1 first on ambiguity):  {tot_opt:+8.4f} USDT")
+if __name__ == "__main__":
+    args = parse_args()
+    results, ambiguities = run_replay(
+        mode=args.mode,
+        with_4h_timeout=args.with_4h_timeout,
+        taker_fee=args.taker_fee,
+        maker_fee=args.maker_fee
+    )
+    tot_gross = sum(r['gross_pnl'] for r in results.values())
+    tot_fees = sum(r['fees_paid'] for r in results.values())
+    tot_net = sum(r['net_pnl'] for r in results.values())
+    tp1_count = sum(1 for r in results.values() if r['tp1_hit'])
+
+    print(f"--- REPLAY RUN [{args.mode.upper()}] (4h Timeout: {args.with_4h_timeout}) ---")
+    print(f"Total Parents Replayed:   {len(results)}")
+    print(f"TP1 Achieved:             {tp1_count} / {len(results)}")
+    print(f"Gross PnL:                {tot_gross:+9.4f} USDT")
+    print(f"Total Fees Paid:          {tot_fees:9.4f} USDT")
+    print(f"Net Realized PnL:         {tot_net:+9.4f} USDT")
+    print(f"Intra-bar Ambiguities:    {ambiguities} trades")
+
+    if args.output_csv:
+        with open(args.output_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=list(next(iter(results.values())).keys()))
+            writer.writeheader()
+            writer.writerows(results.values())
+        print(f"Wrote per-parent replay to {args.output_csv}")
