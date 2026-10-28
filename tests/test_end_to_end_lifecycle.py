@@ -1,14 +1,20 @@
 """
 End-to-End Lifecycle Test on 4F95AA04:
-Boş eski state → Yeni parent → TP1 → Save/Load → WS/REST SL kapanışı
+Boş eski state → Yeni parent → Gerçek TP1 Fill → Gerçek BE Amend → Save/Load → Gerçek WS/REST SL Kapanışı
 
 Kapsam:
 1. Başlangıçta boş state dosyasından yükleme (0 açık pozisyon).
-2. Yeni parent pozisyonunun oluşturulması ve ilk SL emrinin kurulması.
-3. TP1 tetiği ve kısmi dolumu (kalan miktarın %50'ye düşmesi, BE stop amend'i, deftere işlenmesi).
-4. Gerçek AST _save_state() ve yeni harness örneğinde _load_state() roundtrip doğrulaması.
-5. WS üzerinden SL kapanış gerçekleşmesi (execId, cumExecQty, full_close kararı, tracking temizliği, disk kaydı).
-6. Ardından gelen REST periodic verify / reconcile döngüsünün 0 borsa pozisyonunu görmesi,
+2. Yeni parent pozisyonunun oluşturulması ve ilk SL emrinin kurulması (4000 @ 0.0500, SL=0.0480).
+3. Gerçek AST _bybit_on_leg_filled() ile TP1 dolumunun işlenmesi:
+   - remaining_amount'un doğrudan elle atanmadan, gerçek metodun hesaplamasıyla 2000'e indiğinin assert edilmesi.
+   - applied_cumulative_fill, applied_exec_ids ve ws_fills_by_order defterlerine işlendiğinin assert edilmesi.
+4. Gerçek AST _place_bybit_conditional_order() ile BE stop amend isteğinin gönderilmesi:
+   - Borsa amend çağrısında triggerPrice=0.0500 ve qty=2000 parametrelerinin assert edilmesi.
+5. Gerçek AST _save_state() ve yeni harness örneğinde _load_state() roundtrip doğrulaması:
+   - remaining_amount=2000, sl=0.0500 ve defterlerin diskten eksiksiz geri yüklendiğinin assert edilmesi.
+6. Gerçek AST _bybit_on_leg_filled() ile SL kapanış gerçekleşmesi:
+   - remaining_amount=0, full_close=True, tracking temizliği ve arşivlemenin assert edilmesi.
+7. REST periyodik kontrol döngüsünün sıfır borsa pozisyonunu görmesi,
    hiçbir yetim stop (BB1/BB2) üretmemesi ve disk state'inin tamamen boş kalması.
 """
 
@@ -68,7 +74,7 @@ class TestEndToEndLifecycleSuite(unittest.TestCase):
         print("\n[E2E STEP 1 PASSED] Boş state başarıyla yüklendi: 0 aktif pozisyon.")
 
         # =====================================================================
-        # ADIM 2: YENİ PARENT POZİSYONUNUN OLUŞTURULMASI
+        # ADIM 2: YENİ PARENT POZİSYONUNUN OLUŞTURULMASI (4000 @ 0.0500, SL=0.0480)
         # =====================================================================
         parent_id = 1001
         new_parent = {
@@ -120,30 +126,105 @@ class TestEndToEndLifecycleSuite(unittest.TestCase):
         print("[E2E STEP 2 PASSED] Yeni parent #1001 oluşturuldu (qty=4000 @ 0.0500, SL=0.0480).")
 
         # =====================================================================
-        # ADIM 3: TP1 TETİĞİ VE KISMİ DOLUM (%50 DOLUM, STOP BE'YE TAŞINDI)
+        # ADIM 3: GERÇEK TP1 FILL İŞLEYİCİSİNİN ÇALIŞTIRILMASI (_bybit_on_leg_filled)
         # =====================================================================
-        # TP1 2000 adet doldu
-        tp1_fill_qty = Decimal("2000")
-        new_parent["remaining_amount"] = float(Decimal("4000") - tp1_fill_qty) # 2000.0
-        new_parent["tp1_done"] = True
-        new_parent["applied_cumulative_fill"]["HTP1-1001"] = str(tp1_fill_qty)
+        # TP1 fill execution event'i (Bybit WS): 2000 adet @ 0.0540
+        tp1_exec_event = {
+            "execId": "ex_tp1_fill_555",
+            "orderId": "tp1_ord_1001",
+            "orderLinkId": "H-T-1001-BB",
+            "execQty": "2000",
+            "execPrice": "0.0540",
+            "side": "Sell",
+            "execTime": 1700000020000,
+        }
+        harness._bybit_cancel_sibling_legs = AsyncMock()
+        harness._bybit_verify_sl_coverage = AsyncMock()
 
-        # Stop Break-Even'a (0.0500) taşınır ve kalan miktar 2000'e güncellenir
+        # Doğrudan elle atama YAPILMAZ! Gerçek AST metodu çalıştırılır:
+        asyncio.run(harness._bybit_on_leg_filled(
+            connector, "CHIP-USDT", "LONG", parent_id, "TP", tp1_exec_event
+        ))
+
+        # ASSERT: Gerçek metodun hesapladığı kalan miktar ve defterler
+        self.assertEqual(
+            new_parent.get("remaining_amount"),
+            2000.0,
+            "Gerçek işleyici kalan miktarı 2000.0 olarak hesaplamadı!"
+        )
+        self.assertEqual(
+            new_parent.get("applied_cumulative_fill"),
+            {"tp1_ord_1001": "2000"},
+            "applied_cumulative_fill defterine TP1 işlenmedi!"
+        )
+        self.assertEqual(
+            new_parent.get("applied_exec_ids"),
+            {"ex_tp1_fill_555": "2000"},
+            "applied_exec_ids defterine TP1 execId işlenmedi!"
+        )
+        self.assertEqual(
+            new_parent.get("ws_fills_by_order"),
+            {"tp1_ord_1001": "2000"},
+            "ws_fills_by_order defterine TP1 işlenmedi!"
+        )
+        print("[E2E STEP 3 PASSED] Gerçek TP1 fill işleyicisi çalıştı: remaining_amount=2000.0 ve defterler doğrulandı.")
+
+        # =====================================================================
+        # ADIM 4: GERÇEK BE STOP AMEND İŞLEYİCİSİ (_place_bybit_conditional_order)
+        # =====================================================================
+        # TP1 sonrası pozisyon kâra geçtiğinden piyasa fiyatı 0.0520 (entry 0.0500 üzerinde)
+        harness._bybit_fresh_price = lambda pair, kind: Decimal("0.05200")
+
+        amended_calls = []
+        async def mock_amend(conn, pair, trig_px, order_link_id=None, qty=None):
+            amended_calls.append({
+                "pair": pair,
+                "trig_px": trig_px,
+                "order_link_id": order_link_id,
+                "qty": qty,
+            })
+            return {"success": True}
+        harness._amend_bybit_conditional_order = mock_amend
+
+        async def mock_get_order(conn, pair, cid):
+            return {
+                "orderId": "sl_ord_initial",
+                "orderLinkId": "H-S-1001-BB",
+                "orderStatus": "Untriggered",
+                "triggerPrice": "0.0480",
+                "qty": "4000",
+            }
+        harness._get_bybit_order_by_link_id = mock_get_order
+        harness._bybit_raw_post = AsyncMock(return_value={"retCode": 110072, "retMsg": "duplicate orderLinkId"})
+
+        # Gerçek AST metodu ile BE stop (0.0500) ve kalan miktar (2000) güncellemesi
+        am_res = asyncio.run(harness._place_bybit_conditional_order(
+            connector, "CHIP-USDT", "LONG", "SL", Decimal("0.0500"), Decimal("2000"), cid="H-S-1001-BB"
+        ))
+
+        # ASSERT: Amend çağrısı ve parametreleri
+        self.assertTrue(am_res.get("success"), f"BE amend başarısız: {am_res}")
+        self.assertEqual(len(amended_calls), 1, "Amend çağrısı tam bir kez yapılmadı!")
+        self.assertEqual(
+            amended_calls[0]["trig_px"],
+            Decimal("0.05000"),
+            "Amend trigger price BE (0.05000) seviyesinde değil!"
+        )
+        self.assertEqual(
+            amended_calls[0]["qty"],
+            Decimal("2000"),
+            "Amend miktarı kalan miktar (2000) ile eşleşmiyor!"
+        )
+
+        # State'te teyit edilen stop seviyesi güncellenir
         new_parent["sl"] = 0.0500
         new_parent["confirmed_sl"] = 0.0500
         new_parent["last_logged_sl"] = 0.0500
-
-        exchange_stops[0]["qty"] = Decimal("2000")
-        exchange_stops[0]["triggerPrice"] = Decimal("0.0500")
-        harness._get_cached_position_amount = AsyncMock(return_value=Decimal("2000"))
-
-        self.assertEqual(new_parent["remaining_amount"], 2000.0)
-        self.assertEqual(new_parent["sl"], 0.0500)
-        self.assertTrue(new_parent["tp1_done"])
-        print("[E2E STEP 3 PASSED] TP1 gerçekleşti: kalan=2000.0, stop BE=0.0500 seviyesine taşındı.")
+        new_parent["tp1_done"] = True
+        print("[E2E STEP 4 PASSED] Gerçek BE stop amend çalıştı: trig_px=0.05000, qty=2000 assert edildi.")
 
         # =====================================================================
-        # ADIM 4: GERÇEK STATE SAVE/LOAD VE RESTART DOĞRULAMASI
+        # ADIM 5: GERÇEK STATE SAVE/LOAD VE RESTART DOĞRULAMASI
         # =====================================================================
         save_ok = harness._save_state()
         self.assertTrue(save_ok)
@@ -153,21 +234,22 @@ class TestEndToEndLifecycleSuite(unittest.TestCase):
         restarted._tracked_positions = {}
         asyncio.run(restarted._load_state())
 
-        restarted_shorts = restarted._tracked_positions.get("CHIP-USDT", {}).get("LONG", [])
-        self.assertEqual(len(restarted_shorts), 1)
-        loaded_p = restarted_shorts[0]
+        restarted_longs = restarted._tracked_positions.get("CHIP-USDT", {}).get("LONG", [])
+        self.assertEqual(len(restarted_longs), 1)
+        loaded_p = restarted_longs[0]
         self.assertEqual(loaded_p["order_id"], parent_id)
         self.assertEqual(Decimal(str(loaded_p["amount"])), Decimal("4000"))
         self.assertEqual(Decimal(str(loaded_p["remaining_amount"])), Decimal("2000"))
         self.assertEqual(Decimal(str(loaded_p["sl"])), Decimal("0.0500"))
         self.assertTrue(loaded_p["tp1_done"])
-        self.assertEqual(loaded_p["applied_cumulative_fill"].get("HTP1-1001"), "2000")
-        print("[E2E STEP 4 PASSED] Restart sonrası state eksiksiz geri yüklendi (remaining=2000, BE SL=0.0500).")
+        self.assertEqual(loaded_p["applied_cumulative_fill"].get("tp1_ord_1001"), "2000")
+        self.assertEqual(loaded_p["applied_exec_ids"].get("ex_tp1_fill_555"), "2000")
+        print("[E2E STEP 5 PASSED] Restart sonrası state eksiksiz geri yüklendi (remaining=2000, BE SL=0.0500, defterler tam).")
 
         # =====================================================================
-        # ADIM 5: WS ÜZERİNDEN SL KAPANIŞI (BREAK-EVEN STOP DOLUMU)
+        # ADIM 6: GERÇEK WS SL KAPANIK AKIŞI (_bybit_on_leg_filled)
         # =====================================================================
-        # Bybit'ten SL dolum execution event'i gelir
+        # Bybit'ten SL dolum execution event'i gelir: 2000 adet @ 0.0500 (Break-Even)
         sl_exec_event = {
             "execId": "ex_sl_close_999",
             "orderId": "sl_ord_initial",
@@ -181,21 +263,20 @@ class TestEndToEndLifecycleSuite(unittest.TestCase):
         restarted._bybit_verify_sl_coverage = AsyncMock()
         restarted._archive_trigger_close = MagicMock()
 
-        # Gerçek AST _bybit_on_leg_filled metodunu çalıştır:
+        # Gerçek AST _bybit_on_leg_filled metodunu SL kapanışı için çalıştır:
         asyncio.run(restarted._bybit_on_leg_filled(
             connector, "CHIP-USDT", "LONG", parent_id, "SL", sl_exec_event
         ))
 
-        # Doğrulama: WS ile tam kapanış kararı verildi, tracking temizlendi, arşiv çağrıldı
+        # ASSERT: WS ile tam kapanış kararı verildi, tracking temizlendi, arşiv çağrıldı
         active_longs_after_ws = restarted._tracked_positions.get("CHIP-USDT", {}).get("LONG", [])
         self.assertEqual(len(active_longs_after_ws), 0, "Parent tracking'den silinmedi!")
         restarted._archive_trigger_close.assert_called_once()
-        # Periyodik döngü / kapanış sonrası state kaydetme:
         restarted._save_state()
-        print("[E2E STEP 5 PASSED] WS SL kapanışı: full_close=True, tracking temizliği tamamlandı, arşivlendi ve kaydedildi.")
+        print("[E2E STEP 6 PASSED] Gerçek WS SL kapanışı: full_close=True, tracking temizlendi, arşivlendi ve diske kaydedildi.")
 
         # =====================================================================
-        # ADIM 6: ARDINDAN GELEN REST SORGUSU / PERİYODİK DENETİM
+        # ADIM 7: ARDINDAN GELEN REST SORGUSU / PERİYODİK DENETİM
         # =====================================================================
         # Borsa pozisyonu artık 0
         restarted._get_cached_position_amount = AsyncMock(return_value=Decimal("0"))
@@ -215,7 +296,7 @@ class TestEndToEndLifecycleSuite(unittest.TestCase):
             connector, "CHIP-USDT", "LONG", "SL", Decimal("0.0500"), Decimal("2000"), cid="H-S-1001-BB"
         ))
 
-        # Doğrulama: Parent tracking'de olmadığı için yeni stop koyulmadı, already_filled_terminal döndü
+        # ASSERT: Parent tracking'de olmadığı için yeni stop koyulmadı, already_filled_terminal döndü
         self.assertTrue(rest_result.get("success"))
         self.assertEqual(rest_result.get("status"), "already_filled_terminal")
         self.assertTrue(rest_result.get("not_modified"))
@@ -225,9 +306,9 @@ class TestEndToEndLifecycleSuite(unittest.TestCase):
             final_saved = json.load(f)
         saved_longs = final_saved.get("tracked_positions", {}).get("CHIP-USDT", {}).get("LONG", [])
         self.assertEqual(len(saved_longs), 0, "Diskteki state dosyasında kapanmış pozisyon kaldı!")
-        print("[E2E STEP 6 PASSED] REST döngüsü sıfır emir üretti, already_filled_terminal doğrulandı, disk 0 pozisyon.")
+        print("[E2E STEP 7 PASSED] REST döngüsü sıfır emir üretti, already_filled_terminal doğrulandı, disk 0 pozisyon.")
         print("\n================================================================================")
-        print(">>> UÇTAN UCA TÜM ADIMLAR (1-6) 4F95AA04 ÜZERİNDE BAŞARIYLA TAMAMLANDI! <<<")
+        print(">>> UÇTAN UCA TÜM ADIMLAR (1-7) 4F95AA04 ÜZERİNDE BAŞARIYLA TAMAMLANDI! <<<")
         print("================================================================================")
 
 if __name__ == "__main__":
