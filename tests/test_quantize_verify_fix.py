@@ -245,7 +245,7 @@ class TestRealCandidateBody(unittest.TestCase):
     # ─────────────────────────────────────────────────────────────────────────
     def test_01_candidate_sha256_hash_verified(self):
         """Aday dosyanın SHA256 hash'inin tam olarak FBB70BAF... ile eşleştiği doğrulanır."""
-        expected_hash = "4F95AA04183052F4333B32960067E3591C0F48B0A6DBEB512AC442A93687AF41"
+        expected_hash = "0B60DDB301EF1E761DEB5729E8EB6CDB371CF9528D85BE76F581C2BD0B7524A2"
         self.assertEqual(
             CANDIDATE_SHA256,
             expected_hash,

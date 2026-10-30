@@ -27024,8 +27024,46 @@ class TVSignalStrategy(ScriptStrategyBase):
     ) -> None:
         order_id = int(pos_data.get("order_id") or 0)
         side = str(pos_data.get("side") or "").upper()
+        close_amount = Decimal("0")
         try:
             if order_id <= 0 or side not in ("LONG", "SHORT"):
+                return
+
+            try:
+                if "remaining_amount" in pos_data and pos_data["remaining_amount"] is not None:
+                    raw_amt = pos_data["remaining_amount"]
+                else:
+                    raw_amt = pos_data.get("amount", "0")
+                if raw_amt is None:
+                    raise ValueError("None amount")
+                total_amount = Decimal(str(raw_amt))
+                if not total_amount.is_finite() or total_amount.is_nan():
+                    raise ValueError("Non-finite amount")
+            except Exception:
+                # Geçersiz / parse edilemeyen veri: transient hata olabilir.
+                # Sessiz HYBRID_TRANSITIONING kalıcılığını önlemek için WAIT'e dönülür.
+                if pos_data.get("management_stage") == "HYBRID_TRANSITIONING":
+                    pos_data["management_stage"] = "HYBRID_WAIT"
+                return
+
+            if total_amount <= Decimal("0"):
+                # Pozisyon zaten tamamen kapanmış (sıfır miktar).
+                # 1. Sıfır TP1 emri (erken çıkış).
+                # 2. Tekrar tetiklenme engeli: HYBRID_WAIT'e dönülmez; stage terminal kalır.
+                # 3. Kapanış temizliği: tracking temizlenir.
+                self.logger().info(
+                    f"🧹 [HYBRID ZERO AMOUNT] #{order_id} {trading_pair} {side} - Miktar sıfır, kapanış temizliği yapılıyor"
+                )
+                pos_data["tp1_done"] = True
+                pos_data["management_stage"] = "HYBRID_CLOSED"
+                self._cleanup_position_tracking(trading_pair, side, order_id)
+                self._save_state()
+                return
+
+            close_amount = (total_amount / Decimal("2")).quantize(Decimal("0.00000001"))
+            if not close_amount.is_finite() or close_amount <= Decimal("0"):
+                if pos_data.get("management_stage") == "HYBRID_TRANSITIONING":
+                    pos_data["management_stage"] = "HYBRID_WAIT"
                 return
 
             if current_price is not None and current_price > Decimal("0"):
@@ -27047,11 +27085,6 @@ class TVSignalStrategy(ScriptStrategyBase):
             if connector is None:
                 raise RuntimeError(f"connector bulunamadı: {exchange}")
 
-            total_amount = Decimal(str(pos_data.get("remaining_amount") or pos_data.get("amount") or "0"))
-            close_amount = (total_amount / Decimal("2")).quantize(Decimal("0.00000001"))
-            if close_amount <= 0:
-                return
-
             executed = await self._hybrid_execute_tp1_close(
                 connector, exchange, trading_pair, pos_data, close_amount, current_price
             )
@@ -27064,6 +27097,17 @@ class TVSignalStrategy(ScriptStrategyBase):
         finally:
             self._hybrid_transitioning_orders.discard(order_id)
             self._processing_phase2_orders.discard(order_id)
+            # 🎯 DAR DÜZELTME: Yalnızca bu çağrının emir gönderimine ulaşmadığı ve
+            # hiçbir aktif/belirsiz attempt CID taşımadığı kanıtlanan çıkışlarda stage HYBRID_WAIT'e iade edilir.
+            # Pozisyon tamamen kapanmışsa (close_amount <= 0) WAIT'e dönülmez.
+            if pos_data.get("management_stage") == "HYBRID_TRANSITIONING":
+                intent = pos_data.get("tp1_intent") or {}
+                cids = set(intent.get("attempt_cids") or [])
+                if intent.get("current_attempt_cid"):
+                    cids.add(intent.get("current_attempt_cid"))
+                if not cids and not pos_data.get("tp1_done"):
+                    if close_amount > Decimal("0"):
+                        pos_data["management_stage"] = "HYBRID_WAIT"
 
     async def _hybrid_execute_tp1_close(
         self,
@@ -27138,7 +27182,34 @@ class TVSignalStrategy(ScriptStrategyBase):
                 pos_data["management_stage"] = "HYBRID_WAIT"
             return False
 
-        close_amount = (close_amount // step) * step
+        # Fresh amount verification right before order intent creation:
+        try:
+            if "remaining_amount" in pos_data and pos_data["remaining_amount"] is not None:
+                fresh_raw = pos_data["remaining_amount"]
+            else:
+                fresh_raw = pos_data.get("amount", "0")
+            if fresh_raw is None:
+                raise ValueError("None amount")
+            fresh_total = Decimal(str(fresh_raw))
+            if not fresh_total.is_finite() or fresh_total.is_nan():
+                raise ValueError("Non-finite amount")
+        except Exception:
+            if pos_data.get("management_stage") == "HYBRID_TRANSITIONING":
+                pos_data["management_stage"] = "HYBRID_WAIT"
+            return False
+
+        if fresh_total <= Decimal("0"):
+            self.logger().info(
+                f"🧹 [HYBRID ZERO AWAIT] #{order_id} {trading_pair} {side} - Await sırasında miktar sıfırlandı, kapanış temizliği yapılıyor"
+            )
+            pos_data["tp1_done"] = True
+            pos_data["management_stage"] = "HYBRID_CLOSED"
+            self._cleanup_position_tracking(trading_pair, side, order_id)
+            self._save_state()
+            return False
+
+        fresh_close_amount = (fresh_total / Decimal("2")).quantize(Decimal("0.00000001"))
+        close_amount = (fresh_close_amount // step) * step
         if close_amount <= Decimal("0"):
             self.logger().warning(
                 f"⚠️ [HYBRID TP1 ABORT] #{order_id} {trading_pair}: close_amount zero after step normalization (step={step})"
@@ -27188,7 +27259,9 @@ class TVSignalStrategy(ScriptStrategyBase):
         )
         if not (isinstance(res, dict) and res.get("success")):
             intent_record["status"] = "SUBMIT_FAILED"
-            pos_data["management_stage"] = "HYBRID_WAIT"
+            # 🎯 DAR DÜZELTME: Borsa isteği kabul etmiş fakat yanıt ağda kaybolmuş olabilir.
+            # Körleme HYBRID_WAIT'e dönülmez; aşama HYBRID_CLOSE_PENDING kalır ve
+            # attempt_cid uzlaştırma (reconciliation) mekanizmasına devredilir.
             self._save_state()
             return False
 

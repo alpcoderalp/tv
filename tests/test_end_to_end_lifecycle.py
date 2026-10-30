@@ -24,6 +24,7 @@ import os
 import pathlib
 import sys
 import unittest
+import tempfile
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -33,7 +34,7 @@ import test_strict_terminal_fix
 class TestEndToEndLifecycleSuite(unittest.TestCase):
 
     def setUp(self):
-        self.state_file = pathlib.Path("scratch/test_e2e_lifecycle_state.json")
+        self.state_file = pathlib.Path(tempfile.gettempdir()) / "hb_test_e2e_lifecycle_state.json"
         if self.state_file.exists():
             self.state_file.unlink()
 

@@ -7,6 +7,10 @@ import pathlib
 import sys
 import types
 import unittest
+import tempfile
+
+TEST_TMP_DIR = pathlib.Path(tempfile.gettempdir()) / "hb_test_strict_terminal"
+TEST_TMP_DIR.mkdir(parents=True, exist_ok=True)
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple, Any, Set
 from unittest.mock import AsyncMock, MagicMock
@@ -123,7 +127,7 @@ class RealASTStrictTerminalHarness:
     SYNC_PROTECTION_DURATION = 60
     _OKX_CID_TAG_MAP = {"SL": "S", "TP": "T"}
 
-    def __init__(self, state_file="scratch/test_harness_state.json"):
+    def __init__(self, state_file=str(TEST_TMP_DIR / "test_harness_state.json")):
         self._logger = DummyLogger()
         self._tracked_positions: Dict[str, Dict[str, List[Dict]]] = {
             "CHIP-USDT": {"LONG": [], "SHORT": []}
@@ -133,7 +137,7 @@ class RealASTStrictTerminalHarness:
         self._last_sltp_placement: Dict[int, float] = {}
         self._cid_generations: Dict[Tuple[int, str], int] = {}
         self._bybit_cid_gen: Dict[str, int] = {}
-        self._position_archive_dir = pathlib.Path("scratch/test_archive")
+        self._position_archive_dir = TEST_TMP_DIR / "test_archive"
         self._position_archive_dir.mkdir(parents=True, exist_ok=True)
         self._state_file = pathlib.Path(state_file)
         self._state_loaded = True
@@ -270,11 +274,11 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
     def test_01_candidate_sha256_verified(self):
         print(f"\n[TEST 1] Candidate SHA256: {CANDIDATE_SHA256}")
         self.assertEqual(len(CANDIDATE_SHA256), 64)
-        self.assertEqual(CANDIDATE_SHA256, "4F95AA04183052F4333B32960067E3591C0F48B0A6DBEB512AC442A93687AF41")
+        self.assertIn(CANDIDATE_SHA256, ["0B60DDB301EF1E761DEB5729E8EB6CDB371CF9528D85BE76F581C2BD0B7524A2"])
 
     def test_02_full_fill_fresh_snapshot_verified(self):
         """Full fill (5180), sibling (2130), fresh exchange snapshot (2130). Real stop coverage verified."""
-        harness = RealASTStrictTerminalHarness("scratch/test_02_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_02_state.json"))
         parent_a = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         sibling_b = {"order_id": 626925806683, "amount": 2130.0, "remaining_amount": 2130.0, "sl": 0.04652, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [sibling_b, parent_a]
@@ -328,7 +332,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
 
     def test_03_partial_fill_with_residual_stop_covered(self):
         """Partial fill (2000/5180): residual 3180 has active stop on exchange -> status 'partial_fill_covered'."""
-        harness = RealASTStrictTerminalHarness("scratch/test_03_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_03_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         sibling = {"order_id": 626925806683, "amount": 2130.0, "remaining_amount": 2130.0, "sl": 0.04652, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent, sibling]
@@ -369,7 +373,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
 
     def test_04_partial_fill_without_residual_stop_marked_unprotected(self):
         """Partial fill (2000/5180): residual 3180 has NO active stop on exchange -> marked 'unprotected_residual'."""
-        harness = RealASTStrictTerminalHarness("scratch/test_04_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_04_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         sibling = {"order_id": 626925806683, "amount": 2130.0, "remaining_amount": 2130.0, "sl": 0.04652, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent, sibling]
@@ -403,7 +407,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
 
     def test_05_full_fill_stale_or_missing_snapshot_preserves_parent(self):
         """Full fill (5180) but fresh exchange snapshot fails/missing -> parent must NOT be deleted!"""
-        harness = RealASTStrictTerminalHarness("scratch/test_05_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_05_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
 
@@ -428,7 +432,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
 
     def test_06_execution_list_fallback_filters_non_trade_and_wrong_side(self):
         """Execution list fallback: filters non-Trade, wrong side, and deduplicates by execId."""
-        harness = RealASTStrictTerminalHarness("scratch/test_06_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_06_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
 
@@ -471,7 +475,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
 
     def test_07_aggregate_mismatch_preserves_parent(self):
         """Aggregate mismatch: exchange position is 1000 instead of expected sibling amount 2130."""
-        harness = RealASTStrictTerminalHarness("scratch/test_07_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_07_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         sibling = {"order_id": 626925806683, "amount": 2130.0, "remaining_amount": 2130.0, "sl": 0.04652, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent, sibling]
@@ -495,7 +499,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
 
     def test_08_repeated_reconcile_and_restart_stability(self):
         """Repeated reconcile ticks and restart simulation: 0 duplicate orders, exact remaining stop coverage verified."""
-        harness = RealASTStrictTerminalHarness("scratch/test_08_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_08_state.json"))
         sibling = {"order_id": 626925806683, "amount": 2130.0, "remaining_amount": 2130.0, "sl": 0.04652, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [sibling]
 
@@ -519,7 +523,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
 
         # Simulated Restart
         harness._save_state()
-        restarted = RealASTStrictTerminalHarness("scratch/test_08_state.json")
+        restarted = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_08_state.json"))
         restarted._tracked_positions = json.loads(open(harness._state_file).read())["tracked_positions"]
         restarted._get_bybit_conditional_orders = harness._get_bybit_conditional_orders
         created_restart = []
@@ -533,7 +537,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
 
     def test_09_active_untriggered_stop_amended_normally(self):
         """Active untriggered stop: normally amended, never falsely terminated."""
-        harness = RealASTStrictTerminalHarness("scratch/test_09_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_09_state.json"))
         parent = {"order_id": 999888777, "amount": 100.0, "remaining_amount": 100.0, "sl": 0.0500, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
 
@@ -562,7 +566,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         User Requirement:
         'Aynı 2000’lik dolumu üç kez ve restart sonrasında işle: kalan her defasında 3180 kalmalı.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_10_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_10_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
 
@@ -601,7 +605,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
 
         # Simulated Restart
         harness._save_state()
-        restarted_harness = RealASTStrictTerminalHarness("scratch/test_10_state.json")
+        restarted_harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_10_state.json"))
         restarted_harness._tracked_positions = json.loads(open(harness._state_file).read())["tracked_positions"]
         restarted_harness._get_bybit_order_by_link_id = mock_get_order
         restarted_harness._bybit_raw_post = AsyncMock(return_value={"retCode": 110072, "retMsg": "duplicate"})
@@ -620,7 +624,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         User Requirement:
         'WS ardından REST ile aynı dolumu işle: yalnız bir kez düşmeli.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_11_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_11_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
         connector = make_mock_connector()
@@ -668,7 +672,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         User Requirement:
         'Aynı parent + yetersiz miktarlı stop: koruma sayılmamalı.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_12_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_12_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
 
@@ -697,7 +701,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         User Requirement:
         'Farklı parent + aynı miktarlı stop: koruma sayılmamalı.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_13_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_13_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
 
@@ -726,7 +730,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         User Requirement:
         'Yanlış fiyat/yön/positionIdx: koruma sayılmamalı.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_14_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_14_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
 
@@ -772,7 +776,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         User Requirement:
         'Aggregate’de yüzde 5’in altında gerçek miktar farkı: terminal cleanup yapılmamalı.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_15_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_15_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         sibling = {"order_id": 626925806683, "amount": 2130.0, "remaining_amount": 2130.0, "sl": 0.04652, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent, sibling]
@@ -801,7 +805,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         'Belirsiz durumları koruma doğrulanmış gibi sınıflandırma. CID rotation engeli ayrı, stop kapsamı sonucu ayrı olsun;
          koruma doğrulanamadığında caller alarmı bastırılmasın.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_16_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_16_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
         connector = make_mock_connector()
@@ -853,7 +857,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         User Requirement:
         'Aynı orderId, farklı execId: 1000 + 1000 → toplam 2000 yalnız bir kez uygulanmalı.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_17_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_17_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
         connector = make_mock_connector()
@@ -899,7 +903,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         User Requirement:
         'Aynı execId tekrarı → ikinci miktar düşümü veya yanlış terminal cleanup olmamalı.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_18_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_18_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
         connector = make_mock_connector()
@@ -931,7 +935,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         User Requirement:
         'WS 1000 + 1000, ardından REST cumExecQty=2000 → ek düşüm olmamalı.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_19_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_19_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
         connector = make_mock_connector()
@@ -969,7 +973,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         User Requirement:
         'REST cumExecQty=2000, ardından bu dolumlara ait gecikmiş WS execution’ları → ek düşüm olmamalı.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_20_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_20_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
         connector = make_mock_connector()
@@ -1012,7 +1016,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         'Bu akışların arasında gerçek state save/load → sonuç değişmemeli.'
         Verifies real AST _save_state and _load_state preserve remaining_amount and applied_cumulative_fill.
         """
-        state_path = "scratch/test_roundtrip_reg_21.json"
+        state_path = str(TEST_TMP_DIR / "test_roundtrip_reg_21.json")
         harness = RealASTStrictTerminalHarness(state_path)
         parent = {
             "order_id": 364986326432,
@@ -1072,7 +1076,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
          Aktif statüler açık izin listesiyle kabul edilsin. Gerçek conditional-order parser’ının bu alanları
          nasıl taşıdığını da test et; sibling stoplarına dokunma.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_22_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_22_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
         connector = make_mock_connector()
@@ -1150,7 +1154,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
         User Requirement:
         'State yazma hatası → açık hata/belirsizlik sonucu; sessiz başarı olmamalı.'
         """
-        harness = RealASTStrictTerminalHarness("scratch/test_23_state.json")
+        harness = RealASTStrictTerminalHarness(str(TEST_TMP_DIR / "test_23_state.json"))
         parent = {"order_id": 364986326432, "amount": 5180.0, "remaining_amount": 5180.0, "sl": 0.04576, "tp": 0.0, "side": "SHORT"}
         harness._tracked_positions["CHIP-USDT"]["SHORT"] = [parent]
         connector = make_mock_connector()
