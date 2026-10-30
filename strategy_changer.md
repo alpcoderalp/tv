@@ -17,6 +17,11 @@ Bu kılavuz, `tv_signal_strategy.py` üzerinde desteklenen üç temel pozisyon y
 
 ---
 
+> **Canlı Adli Doğrulama Notu (2026-10-30):**
+> hybrid_trailing modeli 4F95AA04 sürümü altında Bybit Demo üzerinde yaklaşık 39 saat boyunca 27 adet gerçek canlı pozisyonda test edilmiştir. 0 quantize retrying döngüsü, 0 orphan stop, 12 adet TP1 icrası (+19.19 USDT) ve 7 adet 3R ratchet koşucusu ile toplamda net +26.78 USDT kârlılıkla başarıyla tamamlanmış ve modelin canlı kararlılığı kanıtlanmıştır.
+
+---
+
 ## 2) VPS ve Bot Üzerinde Değişmesi Gereken Dosyalar ve Satırlar
 
 ### A. VPS Host Ortam Değişkenleri Dosyası

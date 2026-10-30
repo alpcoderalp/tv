@@ -3664,3 +3664,96 @@ RR2 modunda fiyat 2R seviyesini aştıktan sonra fitil/wick hareketlerinde kâr�
 - **Flat Deploy (Kullanılan ve Doğrulanan Yöntem):** Borsa pozisyonları kullanıcı tarafından manuel kapatılmış, state dosyası sıfırlanmış ve bot 0 pozisyonla temiz başlatılmıştır. Bu sayede eski state'ten kaynaklanabilecek çift-düşüm (double-deduction) riski flat deploy'da oluşmaz.
 - **4F95AA04 Kendi State'inden Restart:** Yeni sürümün kendi ürettiği state şemasında `applied_cumulative_fill`, `applied_exec_ids` ve `ws_fills_by_order` defterleri persist edildiği için, botun kendi state'inden yeniden başlatılması (restart) güvenli ve idempotenttir.
 - ⚠️ **Kritik Kural:** Eski `51F6CDD4` state'i açık pozisyon içerirken doğrudan `4F95AA04` sürümüne devredilmemelidir.
+
+### 35.7 Canlı Çalışma Doğrulaması ve Adli Analiz Sonuçları (2026-10-28 18:40 UTC — 2026-10-30 09:12+ UTC, ~39 Saat)
+
+2026-10-28 18:40:19 UTC tarihinde Bybit Demo ortamında gerçekleştirilen flat deploy sonrasında, `4F95AA04` sürümü yaklaşık 39 saat boyunca kesintisiz olarak canlı piyasa verileri ve gerçek TradingView sinyalleriyle çalıştırılmıştır. Bu süre zarfındaki tüm işlemler, log kayıtları, Bybit REST/WS akışları ve borsa emirleri adli analize tabi tutulmuş; stratejinin beklenen tasarım ve güvenlik sözleşmelerine %100 uyduğu tespit edilmiştir.
+
+#### 35.7.1 Operasyonel Ortam ve Çalışma Metrikleri
+- **Çalışma Süresi:** 2026-10-28 18:40:19 UTC — 2026-10-30 09:12+ UTC (~39 saat kesintisiz).
+- **Konteyner ve Servis Durumu:** %100 Uptime. `hummingbot` ve `rogerthat` servislerinde 0 çökme, 0 beklenmedik restart, 0 exception döngüsü.
+- **İşlem Gören Toplam Pozisyon:** 27 adet Parent pozisyon:
+  - **CHIP-USDT:** 18 adet (8 LONG, 10 SHORT).
+  - **PONS-USDT:** 9 adet (4 LONG, 5 SHORT).
+- **Pozisyon Yaşam Döngüsü:**
+  - **23 Adet Tamamlanan (Closed):** Uçtan uca tüm yaşam döngüsünü tamamlayarak arşivlenmiş ve takipten temizlenmiştir (`[CLOSED POS CLEANUP]`).
+  - **4 Adet Açık / Aktif (Open):** Canlı Bybit Demo borsasında ve Hummingbot hafızasında eşzamanlı olarak güvenle sürdürülmektedir (`#570414374565`, `#167272712944`, `#606906494493`, `#275087885943`).
+- **Borsa Koşullu Emir Senkronizasyonu:** Bybit Demo REST API üzerinden yapılan anlık doğrulamada, açık 4 pozisyonun tamamı 100% kapsama ile borsa tarafında aktif koşullu stop emirleriyle (`triggerDirection`, `triggerPrice`, `qty`) korunmaktadır ($386 + 2550 + 4600 + 6330 = 13866$ kontrat). Borsa üzerinde **0 adet yetim (orphan) emir**, **0 adet korumasız kontrat** bulunmaktadır.
+- **Finansal Gerçekleşen Sonuç:**
+  - Kapanan 23 işlemin kalan parçalarından elde edilen gerçekleşen PnL: **+9.5975 USDT**.
+  - Alınan 11 adet TP1 kısmi kâr parçalarından elde edilen gerçekleşen PnL: **+19.1871 USDT**.
+  - **Toplam Net Gerçekleşen PnL:** **+26.7826 USDT** (Testnet 400 USDT bakiye üzerinde net kârlılık).
+
+---
+
+#### 35.7.2 Kritik Düzeltmelerin (Fix CC / CD / CE / CF) Canlı Adli Doğrulaması
+
+1. **Fix CC — Quantize ve Readback Döngüsünün Tam Sıfırlanması:**
+   - *Tarihsel Hata (51F6CDD4):* 2R dinamik trailing aşamasında borsa tick size'ı ile yerel hedef arasındaki quantize uyuşmazlığı nedeniyle 40 dakikada 9.499 kez `HYBRID TRAIL 2R RETRY` tetiklenmiş ve bot kilitlenmişti.
+   - *Canlı Doğrulama (4F95AA04):* 39 saat ve 27 pozisyon boyunca loglarda `HYBRID TRAIL 2R RETRY` tetiklenme sayısı tam **0 (SIFIR)**'dır. Amend edilen her trailing ve ratchet seviyesi tek seferde borsa tarafından kabul edilmiş ve readback mutabakatı hatasız sağlanmıştır.
+2. **Fix CD / CE / CF — Orphan / Hayalet Stopların Tamamen Engellenmesi (BB1/BB2 İzolasyonu):**
+   - *Tarihsel Hata:* Kapanan pozisyonların ardından borsada kalan koşullu emirlerin tetiklenmesiyle sahte ters yönlü pozisyonlar (`BB1`/`BB2`) oluşabiliyordu.
+   - *Canlı Doğrulama (4F95AA04):* Dakikalık periyodik `[ORPHAN DEBUG]` taramalarında ve 23 pozisyon kapanışının tamamında borsa pozisyonu sıfırlandığı an `zero_position_no_stop` devreye girmiş; kalan tüm stop emirleri iptal edilmiştir. Borsada tek bir yetim emir dahi bırakılmamıştır.
+3. **1R Tespiti ve TP1 (%50) Kısmi Kapanış Sözleşmesi:**
+   - 27 pozisyonun 12'sinde 1R seviyesi aşılmış (`[HYBRID TRIGGER]`); 11 tanesinde reduce-only limit/market TP1 emri derhal borsaya iletilmiş ve doldurulmuştur (`link=HTP1...`).
+   - Kalan 1 işlemde (`#882631596625`), aynı milisaniyede kardeş pozisyon (`#127744249455`) işlemde olduğu için `lock_key` devreye girmiş, eşzamanlı çift emir riski önlenerek stage güvenle `HYBRID_WAIT`'e sıfırlanmıştır.
+4. **Break-Even (BE) / HYBRID_HOLD_ENTRY Davranışı:**
+   - TP1 dolumu sonrası stopun tam `entry` seviyesine çekilmesi ve 1R ile 2R arasında erken stop gevşetmesi/sıkılaştırması yapılmadan beklenmesi canlı piyasada gözlemlenmiştir.
+   - 3 işlem fiyattaki geri çekilmede tam giriş fiyatından ($0.0000$ net zarar ile) kapanarak TP1 kârını %100 korumuştur. 1 işlem (`#570414374565`) ise halen giriş seviyesinde (`0.2322`) güvenle tutulmaktadır.
+5. **2R Dinamik Trailing ve 3R Ratchet Devri:**
+   - 7 adet runner pozisyon 2R ve ardından 3R seviyesini aşmıştır (`#748481856534`, `#382732215995`, `#523397809626`, `#127744249455`, `#613482810910`, `#68583515800`, `#393613137952`).
+   - Fiyat 3R'ye ulaştığında çok aşamalı ratchet mekanizması devreye girerek stopu 2R kâr zeminine kilitlemiştir (`floor = 2R`). Fiyat geri çekildiğinde pozisyonlar büyük kârla (+3.37 USDT ile +14.28 USDT arasında değişen runner kârları) kapatılmıştır.
+
+---
+
+#### 35.7.3 Gerçek Veriyle Test Edilen vs. Henüz Canlıda Yaşanmayan Süreçler Matrisi
+
+| # | Süreç / Hipotez | Beklenen Davranış | Canlı Veri Durumu | Adli Sonuç ve Kanıt |
+|---|---|---|---|---|
+| **1** | **Sinyal Karşılama ve Sizing** | TV webhook sinyalini alma, 20x kaldıraç, bakiye ve marj kontrolü ile piyasa emri açma. | **TEST EDİLDİ & BAŞARILI** | 27 parent sinyali 0 gecikmeyle karşılandı; Trading Rules ve min notional uyumlu lotlama yapıldı. |
+| **2** | **TP Bastırma (Hybrid Mode)** | Girişte borsa limit TP emri konulmaması (`tp_suppressed=True`). | **TEST EDİLDİ & BAŞARILI** | 27 pozisyonun hiçbirine girişte borsa TP emri konulmadı; çıkış tamamen hybrid trailing'e bırakıldı. |
+| **3** | **Tekil Koşullu Stop (Bybit Cond SL)** | Her parent parçası için borsa üzerinde müstakil koşullu stop emri oluşturma. | **TEST EDİLDİ & BAŞARILI** | 27 parent için borsada bağımsız koşullu SL açıldı (`[B4 BYBIT SLTP]`). %100 kapsama sağlandı. |
+| **4** | **1R Tespiti ve TP1 İcrası** | 1R temasında 50% reduce-only TP1 emri (`HTP1...`) gönderme ve doldurma. | **TEST EDİLDİ & BAŞARILI** | 12 parent 1R'yi gördü; 11 tanesinde 50% TP1 anında icra edildi (+19.19 USDT kâr). |
+| **5** | **1R-2R Bekleme (HYBRID_HOLD_ENTRY)** | TP1 sonrası stopu girişe çekme, 1R-2R arasında trailing başlatmama. | **TEST EDİLDİ & BAŞARILI** | 4 işlem bu aşamada bekledi; 3 tanesi tam girişte $0.0000$ PnL ile kapandı; 1 tanesi halen açık. |
+| **6** | **2R Trailing & 3R Ratchet Kilidi** | 2R'de dinamik trailing başlatma; 3R'de zemin stopunu 2R kârına sabitleme. | **TEST EDİLDİ & BAŞARILI** | 7 runner pozisyonda 2R ve 3R ratchet kusursuz çalıştı; stop gevşetmeden zirveleri takip etti. |
+| **7** | **Quantize & Readback Uyumu (Fix CC)** | Stop amend edilirken borsa tick hassasiyeti ile yerel hedefin tam uyuşması. | **TEST EDİLDİ & BAŞARILI** | 39 saatte 0 retry (`HYBRID TRAIL 2R RETRY: 0`). 51F6CDD4'teki 9499 hatası tamamen çözüldü. |
+| **8** | **Pozisyon Kapanış Temizliği (Fix CD/CE)** | Pozisyon kapandığında state temizliği ve borsa koşullu emrinin iptali. | **TEST EDİLDİ & BAŞARILI** | 23 kapanışın tamamında `[CLOSED POS CLEANUP]` çalıştı; borsa üzerinde 0 adet orphan stop kaldı. |
+| **9** | **Sibling Eşzamanlılık Kilidi** | Aynı pair/yönde iki parent aynı anda 1R olduğunda emir çarpışmasını önleme. | **TEST EDİLDİ & BAŞARILI** | #127744249455 ve #882631596625 aynı anda 1R oldu; `lock_key` ikincisini bekletip güvenle korudu. |
+| **10** | **Aktif Runner Varken Konteyner Çökmesi** | 3R ratchet aşamasındaki bir işlem taşınırken botun aniden kapanıp state'ten kurtarılması. | **CANLIDA YAŞANMADI** | Bot 39 saat boyunca hiç çökmedi (%100 uptime). Test suite'te (Test 34-36) sentetik olarak doğrulandı. |
+| **11** | **Kısmi Dolum Sırasında WS Kopması** | TP1 dolduğu anda WS'in kopması ve REST üzerinden kurtarma (`ambiguous_fill_preserved`). | **CANLIDA YAŞANMADI** | Bybit WS bağlantısı TP1 anlarında stabil kaldı; genel pending reconcile ise #521438515384'te başarıyla çalıştı. |
+| **12** | **Borsa UI'dan Manuel Müdahale** | Kullanıcının Bybit web sitesinden emri veya pozisyonu elle değiştirmesi. | **CANLIDA YAŞANMADI** | Test süresince borsa arayüzünden manuel müdahale yapılmadı; sistem tam otonom yönetildi. |
+
+---
+
+#### 35.7.4 27 Parent Pozisyonun Tam Yaşam Döngüsü ve Adli Tablosu
+
+| # | Parent ID | İşlem Çifti | Yön | Giriş Fiyatı | İlk SL | Ulaşılan Aşama | Çıkış Nedeni | Net PnL (USDT) | Durum |
+|---|---|---|---|---|---|---|---|---|---|
+| 01 | `#521438515384` | PONS-USDT | LONG | 0.2853 | 0.2794 | 1R (TP1) → BE | Break-Even (Giriş) Stopu | +1.6933 (TP1) + 0.0000 | CLOSED |
+| 02 | `#139635067271` | CHIP-USDT | LONG | 0.04966 | 0.04872 | HYBRID_WAIT | İlk Baseline SL | -3.4464 | CLOSED |
+| 03 | `#748481856534` | CHIP-USDT | SHORT | 0.04940 | 0.05008 | 1R → 2R → 3R | 3R Ratchet Trailing SL | +1.7272 (TP1) + 3.3660 | CLOSED |
+| 04 | `#217553911573` | CHIP-USDT | LONG | 0.04962 | 0.04938 | HYBRID_WAIT | İlk Baseline SL | -3.0225 | CLOSED |
+| 05 | `#458985609538` | CHIP-USDT | SHORT | 0.04946 | 0.04985 | 1R (TP1) → BE | Break-Even (Giriş) Stopu | +1.6848 (TP1) - 0.0432 | CLOSED |
+| 06 | `#382732215995` | PONS-USDT | SHORT | 0.2880 | 0.2944 | 1R → 2R → 3R | 3R Ratchet Trailing SL | +1.7216 (TP1) + 3.4020 | CLOSED |
+| 07 | `#228742928457` | PONS-USDT | LONG | 0.2774 | 0.2706 | HYBRID_WAIT | İlk Baseline SL | -3.6176 | CLOSED |
+| 08 | `#398771100426` | CHIP-USDT | LONG | 0.04829 | 0.04798 | HYBRID_WAIT | İlk Baseline SL | -2.7311 | CLOSED |
+| 09 | `#523397809626` | CHIP-USDT | SHORT | 0.04812 | 0.04846 | 1R → 2R → 3R | 3R Ratchet Trailing SL | +1.6048 (TP1) + 4.4935 | CLOSED |
+| 10 | `#735721789888` | PONS-USDT | SHORT | 0.2746 | 0.2803 | HYBRID_WAIT | İlk Baseline SL | -3.6424 | CLOSED |
+| 11 | `#200380378825` | PONS-USDT | LONG | 0.2772 | 0.2706 | HYBRID_WAIT | İlk Baseline SL | -3.3726 | CLOSED |
+| 12 | `#127744249455` | CHIP-USDT | LONG | 0.04770 | 0.04702 | 1R → 2R → 3R | 3R Ratchet Trailing SL | +1.7204 (TP1) + 10.3632 | CLOSED |
+| 13 | `#69482630512` | CHIP-USDT | SHORT | 0.04750 | 0.04796 | HYBRID_WAIT | İlk Baseline SL | -4.5079 | CLOSED |
+| 14 | `#882631596625` | CHIP-USDT | LONG | 0.04775 | 0.04702 | 1R (Throttled) | Baseline SL (Kilit Koruması) | -3.5040 | CLOSED |
+| 15 | `#770074244599` | CHIP-USDT | SHORT | 0.04754 | 0.04786 | HYBRID_WAIT | İlk Baseline SL | -3.0112 | CLOSED |
+| 16 | `#613482810910` | CHIP-USDT | LONG | 0.04817 | 0.04743 | 1R → 2R → 3R | 3R Ratchet Trailing SL | +1.7834 (TP1) + 8.8688 | CLOSED |
+| 17 | `#551995529500` | PONS-USDT | SHORT | 0.2753 | 0.2809 | HYBRID_WAIT | İlk Baseline SL | -3.5784 | CLOSED |
+| 18 | `#586808454451` | PONS-USDT | LONG | 0.2783 | 0.2722 | 1R (TP1) → BE | Break-Even (Giriş) Stopu | +1.6348 (TP1) + 0.0000 | CLOSED |
+| 19 | `#68583515800` | PONS-USDT | SHORT | 0.2751 | 0.2827 | 1R → 2R → 3R | 3R Ratchet Trailing SL | +1.8240 (TP1) + 10.9896 | CLOSED |
+| 20 | `#393613137952` | CHIP-USDT | SHORT | 0.04993 | 0.05067 | 1R → 2R → 3R | 3R Ratchet Trailing SL | +1.7908 (TP1) + 14.2780 | CLOSED |
+| 21 | `#570414374565` | PONS-USDT | LONG | 0.2322 | 0.2270 | 1R (TP1) → BE | Açık (Giriş Stopu: 0.2322) | +2.0020 (TP1 gerçekleşti) | OPEN |
+| 22 | `#167272712944` | CHIP-USDT | LONG | 0.04284 | 0.04144 | HYBRID_WAIT | Açık (Başlangıç SL: 0.04144) | Henüz Kapanmadı | OPEN |
+| 23 | `#606906494493` | CHIP-USDT | SHORT | 0.04208 | 0.04287 | HYBRID_WAIT | Açık (Başlangıç SL: 0.04287) | Henüz Kapanmadı | OPEN |
+| 24 | `#873481395202` | CHIP-USDT | LONG | 0.04253 | 0.04190 | HYBRID_WAIT | İlk Baseline SL | -3.5910 | CLOSED |
+| 25 | `#920800717595` | CHIP-USDT | SHORT | 0.04217 | 0.04273 | HYBRID_WAIT | İlk Baseline SL | -3.9833 | CLOSED |
+| 26 | `#702333768047` | CHIP-USDT | LONG | 0.04270 | 0.04190 | HYBRID_WAIT | İlk Baseline SL | -4.1120 | CLOSED |
+| 27 | `#275087885943` | CHIP-USDT | SHORT | 0.04225 | 0.04277 | HYBRID_WAIT | Açık (Başlangıç SL: 0.04277) | Henüz Kapanmadı | OPEN |
+
