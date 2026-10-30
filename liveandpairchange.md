@@ -102,15 +102,16 @@ Canlı ortama geçiş için `tv_signal_strategy.py` kodunda manuel değişiklik 
    ```bash
    ssh -p 22022 ubuntu@57.129.5.114 "docker stop hummingbot"
    ```
-4. **Demo State Dosyasını Temizleyin:**
-   Demo işlemlerine ait hiçbir eski kimlik veya defterin canlıya taşınmaması için state dosyasını silin:
+4. **Demo State Dosyasını Yedekleyin ve Temizleyin:**
+   Demo işlemlerine ait hiçbir eski kimlik veya defterin canlıya taşınmaması için önce zaman damgalı yedek alın, ardından sıfırlayın:
    ```bash
-   ssh -p 22022 ubuntu@57.129.5.114 "sudo rm -f /home/ubuntu/deploy/bots/data/tv_signal_state.json /home/ubuntu/deploy/bots/data/tv_signal_state.json.bak"
+   ssh -p 22022 ubuntu@57.129.5.114 "sudo cp /home/ubuntu/deploy/bots/data/tv_signal_state.json /home/ubuntu/deploy/bots/data/tv_signal_state_backup_demo_to_live_\$(date +%Y%m%d_%H%M%S).json && sudo rm -f /home/ubuntu/deploy/bots/data/tv_signal_state.json /home/ubuntu/deploy/bots/data/tv_signal_state.json.bak"
    ```
 5. **Konfigürasyonları Güncelleyin:**
    * `/home/ubuntu/deploy/.env.hummingbot` $\rightarrow$ `BYBIT_ENV=live`
    * `/home/ubuntu/deploy/bots/conf/scripts/tv_signal_strategy.yml` $\rightarrow$ `bybit_perpetual:`
-6. **Konteyneri Yeniden Oluşturup Başlatın:**
+6. **Konteyneri Yeniden Oluşturup Başlatın (`--force-recreate` Runbook Yöntemi):**
+   Docker Compose'un standart `restart` komutu `.env.hummingbot` içindeki `BYBIT_ENV=live` değişikliğini çalışan konteynere yeniden yüklemez. Güncellenen ortam değişkenlerinin konteynere aktarılması ve volume bağlarının korunması için `--force-recreate` seçilmiş standart runbook yöntemidir:
    ```bash
    ssh -p 22022 ubuntu@57.129.5.114 "cd /home/ubuntu/deploy && docker compose up -d --force-recreate hummingbot"
    ```
@@ -188,7 +189,7 @@ Yeni bir pair eklendiğinde TradingView tarafında alert oluştururken:
 ### 5. Pair Güncellemesi Sonrası Uygulama ve Doğrulama Adımları
 
 1. YAML dosyasını kaydedin.
-2. Hummingbot konteynerini yeniden başlatın:
+2. Hummingbot konteynerini yeniden başlatın (`--force-recreate` runbook yöntemiyle):
    ```bash
    ssh -p 22022 ubuntu@57.129.5.114 "cd /home/ubuntu/deploy && docker compose up -d --force-recreate hummingbot"
    ```

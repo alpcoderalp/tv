@@ -10,7 +10,7 @@ Bu kılavuz, `tv_signal_strategy.py` üzerinde desteklenen üç temel pozisyon y
 |---|---|---|---|---|
 | **Temel Felsefe** | Klasik Faz 2: 1R'de %50 kısmi kâr al, SL'yi girişe çek, kalanı dinamik merdivenle sür. | Saf Trend Runner: 1R'de işlem yapma, 2R'de SL'yi R1'e kitle, fitil zeminleriyle çok aşamalı sür. | Hibrit Denge: 1R'de %50 TP1 al + SL girişe çek (BE). 1R-2R arası bekle. 2R'de dinamik trailing, 3R'de ratchet. | Yalnızca giriş ve ilk SL/TP konur; dinamik yönetim ve koruma onarımları kapalıdır. |
 | **Girişte TP Emri** | **KONUR** (Fix BR fee-aware 2R limit TP). | **KONULMAZ** (`RR2_PLACE_ENTRY_TP=0`). | **KONULMAZ** (`tp_suppressed=True`). | **KONUR** (Orijinal sinyal TP'si). |
-| **1R Seviyesinde** | `_try_trigger_legacy_phase2`: %50 market kapatılır + SL girişe taşınır. | **HİÇBİR ŞEY YAPILMAZ** (`1r_reached=False`, doğru davranış). | `_try_trigger_hybrid_trailing`: %50 TP1 kapatılır + SL girişe (+%0.5 BE) taşınır. | Hiçbir şey yapılmaz. |
+| **1R Seviyesinde** | `_try_trigger_legacy_phase2`: %50 market kapatılır + SL girişe taşınır. | **HİÇBİR ŞEY YAPILMAZ** (`1r_reached=False`, doğru davranış). | `_try_trigger_hybrid_trailing`: %50 TP1 kapatılır + SL tam giriş fiyatına (`entry`) taşınır (ek %0.5 stop tamponu yoktur; log etiketi tarihsel olarak `[HYBRID +0.5% BE]` geçer). | Hiçbir şey yapılmaz. |
 | **1R – 2R Arasında** | Dinamik trailing başlar. | Normal pozisyon gibi ilk SL korunur. | `HYBRID_HOLD_ENTRY`: Stop girişte kilitli tutulur, trailing çalışmaz (erken çıkış önlenir). | Hiçbir şey yapılmaz. |
 | **2R Seviyesinde** | Faz 2 TP2 hedefi hit olur (`TARGET HIT`). | `_try_trigger_rr2_management`: SL fee-aware R1'e kilitlenir (`RR2_ARMED_R1`) → +%0.2 ile `RR2_TRAIL_2R`. | `HYBRID_TRAIL_2R`: Dinamik trailing merdiveni devreye girer. | Hiçbir şey yapılmaz. |
 | **3R ve Üzerinde** | Pozisyon zaten 2R'de tamamen kapanmıştır. | Multi-stage ratchet: 3R..10R fitil zeminleri (`floor`), max 11R tavanı. | `HYBRID_TRAIL_3R`: Tam RR2 multi-stage ratchet mantığına devredilir. | Hiçbir şey yapılmaz. |
@@ -84,7 +84,7 @@ RR2_PLACE_ENTRY_TP=0
 4. **1R ve 2R Tetikleyici Fonksiyonları:**
    * **Satır 27780 (`_try_trigger_legacy_phase2`):** Legacy %50 kısmi kapanış ve SL'nin başabaşa taşınması.
    * **Satır 26322 (`_try_trigger_rr2_management`):** RR2 2R kontrolü, R1 kilit emri, failsafe limit/market kapatıcıları.
-   * **Satır 26900 – 27150 (`_try_trigger_hybrid_trailing`):** Hybrid TP1 yürütülmesi, BE taşınması ve `HYBRID_HOLD_ENTRY` aşamasına geçiş.
+   * **Satır 26900 – 27150 (`_try_trigger_hybrid_trailing`):** Hybrid TP1 yürütülmesi, SL'nin `entry` seviyesine taşınması (`_hybrid_apply_05_be` gerçekte `sl_price=entry` gönderir) ve `HYBRID_HOLD_ENTRY` aşamasına geçiş.
 
 5. **Dinamik Trailing ve Borsa Amend Motoru:**
    * **Satır 34234 (`_update_trailing_sl_rr2_strict`):** Borsa koşullu emrinin atomik olarak değiştirilmesi ve readback ile doğrulanması.
@@ -123,10 +123,10 @@ python scratch/verify_bybit_flat.py
 ssh -p 22022 ubuntu@57.129.5.114 "docker stop hummingbot"
 ```
 
-### Adım 5: Eski State Dosyasını Temizleyin (ZORUNLU)
-Eski moda ait kalıntı aşama bayraklarının yeni moda sızmaması için state dosyasını sıfırlayın:
+### Adım 5: Mevcut State Dosyasını Yedekleyin ve Sıfırlayın (ZORUNLU)
+Eski moda ait kalıntı aşama bayraklarının yeni moda sızmaması için önce zaman damgalı yedek alın, ardından sıfırlayın:
 ```bash
-ssh -p 22022 ubuntu@57.129.5.114 "sudo rm -f /home/ubuntu/deploy/bots/data/tv_signal_state.json /home/ubuntu/deploy/bots/data/tv_signal_state.json.bak"
+ssh -p 22022 ubuntu@57.129.5.114 "sudo cp /home/ubuntu/deploy/bots/data/tv_signal_state.json /home/ubuntu/deploy/bots/data/tv_signal_state_backup_\$(date +%Y%m%d_%H%M%S).json && sudo rm -f /home/ubuntu/deploy/bots/data/tv_signal_state.json /home/ubuntu/deploy/bots/data/tv_signal_state.json.bak"
 ```
 
 ### Adım 6: `.env.hummingbot` Dosyasında Hedef Modu Ayarlayın
@@ -147,8 +147,8 @@ VPS üzerinde `/home/ubuntu/deploy/.env.hummingbot` dosyasını düzenleyin:
   RR2_PLACE_ENTRY_TP=0
   ```
 
-### Adım 7: Konteyneri Yeniden Oluşturup Başlatın
-Ortam değişkenlerinin temiz şekilde geçerli olması için konteyneri recreate edin:
+### Adım 7: Konteyneri Yeniden Oluşturup Başlatın (`--force-recreate` Runbook Yöntemi)
+Docker Compose'un standart `restart` komutu `.env.hummingbot` dosyasındaki yeni ortam değişkenlerini çalışan konteynere yeniden yüklemez. Değiştirilen ortam değişkenlerinin konteynere temiz şekilde aktarılması ve hacim (volume) bağlarının korunması için `--force-recreate` seçilmiş standart runbook yöntemidir:
 ```bash
 ssh -p 22022 ubuntu@57.129.5.114 "cd /home/ubuntu/deploy && docker compose up -d --force-recreate hummingbot"
 ```
@@ -185,12 +185,21 @@ Geçiş sonrası gelen ilk işlemde aşağıdaki log imzaları takip edilmelidir
 
 ---
 
-## 5) Hızlı Acil Geri Dönüş (Rollback)
+## 5) Acil Durum Mod Yeniden Yapılandırması (Legacy Moduna Geçiş)
 
-Herhangi bir beklenmeyen durumda `legacy` moduna geri dönmek için:
-1. `ssh -p 22022 ubuntu@57.129.5.114 "docker stop rogerthat"`
-2. Pozisyonları kapatın / sıfırlayın.
+> [!NOTE]
+> Bu adım operasyonel bir mod yeniden yapılandırmasıdır (reconfiguration); kod düzeyinde bir "yazılım rollback" (önceki sürüme geri dönüş) değildir. Eğer gerçek bir yazılım rollback gerekirse, kalıcı koda yedeklenen `tv_signal_strategy_51F6CDD4.py` script'i ve pre-deploy state yedeği geri yüklenmelidir.
+
+Herhangi bir beklenmeyen durumda operasyonel olarak `legacy` moduna dönmek için:
+1. Sinyal girişini kesin: `ssh -p 22022 ubuntu@57.129.5.114 "docker stop rogerthat"`
+2. Borsa pozisyonlarını ve emirleri manuel kapatıp sıfırlayın (`verify_bybit_flat.py` ile doğrulayın).
 3. `/home/ubuntu/deploy/.env.hummingbot` içinde `POSITION_MANAGEMENT_MODE=legacy` ve `RR2_PLACE_ENTRY_TP=1` yapın.
-4. `ssh -p 22022 ubuntu@57.129.5.114 "sudo rm -f /home/ubuntu/deploy/bots/data/tv_signal_state.json"`
-5. `ssh -p 22022 ubuntu@57.129.5.114 "cd /home/ubuntu/deploy && docker compose up -d --force-recreate hummingbot && docker start rogerthat"`
+4. Mevcut state'i yedekleyip temizleyin:
+   ```bash
+   ssh -p 22022 ubuntu@57.129.5.114 "sudo cp /home/ubuntu/deploy/bots/data/tv_signal_state.json /home/ubuntu/deploy/bots/data/tv_signal_state_backup_legacy_\$(date +%Y%m%d_%H%M%S).json && sudo rm -f /home/ubuntu/deploy/bots/data/tv_signal_state.json /home/ubuntu/deploy/bots/data/tv_signal_state.json.bak"
+   ```
+5. Değişen env'lerin yüklenmesi için seçilmiş runbook yöntemiyle konteyneri recreate edin ve sinyal servisini açın:
+   ```bash
+   ssh -p 22022 ubuntu@57.129.5.114 "cd /home/ubuntu/deploy && docker compose up -d --force-recreate hummingbot && docker start rogerthat"
+   ```
 

@@ -69,13 +69,17 @@
 > **§33 = v5.8 — RR2 MULTI-STAGE RATCHET TRAILING v4 FINAL (Fix CA: wick floor kilidi, 11R tavanı, ladder anchor ayrımı).**
 > **§34 = v5.9 — HYBRID TRAILING MODE (Fix CB: 1R TP1 %50 + BE + 1R-2R hold entry + 2R trailing + 3R ratchet).**
 > **§35 = v6.0 — BYBIT DEMO UNIFIED CANDIDATE (4F95AA04) — QUANTIZE LOOP, TERMINAL STOP IDEMPOTENT FILL ACCOUNTING & RECONCILE (Fix CC/CD/CE/CF) (EN GÜNCEL).**
-> Çelişki olursa: **§35 > §34 > §33 > §32 > §31 > §30 > §29 > §28 > §27 > §26 > §25 > §24 > §23 > §22 > §21 > §20 > §19 > §18 > §17 > §16 > §15 > §14 > §13 > §12 > §11 > §10 > §1-9.**
+> 📌 **KAYNAK ÖNCELİĞİ VE DOĞRULUK HİYERARŞİSİ:**
+> 1. **Güncel Kod Davranışı Kaynağı:** Hash'i sabitlenmiş kaynak kodudur (`tv_signal_strategy.py` SHA256: `4f95aa04183052f4333b32960067e3591c0f48b0a6dbeb512ac442a93687af41`).
+> 2. **Canlı Runtime Durumu Kaynağı:** Taze UTC zaman damgalı Bybit API sorguları, aktif container ortam değişkenleri ve ham log kayıtlarıdır.
+> 3. **Dokümantasyon Notları:** Bölüm numaraları (§) kronolojik evrim sürecini ve analiz bağlamını temsil eder; tek başına bir bölüm numarası koddaki ve runtime'daki kesin kanıtların üzerinde mutlak doğruluk kaynağı değildir (tarihsel çelişkilerde öncelik güncel bölümlerdedir: §35 > §34 > §33 > §32 > §31...).
 > §11.1, §12.1, §16.1, §17.2 ve **§18.3**'teki API gerçekleri *varsayım değil*, canlı
 > probe ile doğrulanmıştır — **aynı şeyleri tekrar test etmeyin.**
 > ⚠️ **Deploy durumu (2026-10-28):** **v6.0 Unified Release (Fix CC/CD/CE/CF) Bybit Demo ortamında kalıcı olarak DEPLOY EDİLDİ.**
 > Host/container SHA256: `4f95aa04183052f4333b32960067e3591c0f48b0a6dbeb512ac442a93687af41` (birebir eşleşti).
 > Test suite: **37/37 PASS** (`tests/run_all_candidate_tests.py` — 23 strict terminal + 13 quantize + 1 real AST E2E).
-> VPS durumu: Bybit Demo 0 pozisyon, 0 açık emir doğrulandı; `hummingbot` ve `rogerthat` (port 80) UP ve sağlıklı.
+> VPS durumu (Deploy Anı Snapshot — 2026-10-28 18:41:27 UTC): Bybit Demo REST API üzerinden taze denetimle 0 pozisyon, 0 limit emir, 0 koşullu/stop emir doğrulanarak flat başlatıldı; bu sürekli bir durum değil, deploy anına ait anlık bir görüntüdür (snapshot).
+> ⚠️ **Runtime Doğrulama Sınırı:** Deploy sonrasında doğal sinyalle yeni pozisyon açılması (ör. 2026-10-28 19:30:13 UTC PONS-USDT LONG), botun sinyal alıp işlediğini gösterir ancak trailing ilerlemesi, borsa amend veya terminal kapanış mantığının canlıda tam doğrulandığı anlamına gelmez; bu akışlar ancak doğal 1R/2R/3R veya SL tetiklenme anlarında doğrulanabilir.
 > ⚠️ **Eski deploy durumu (2026-09-01):** **v5.5 (BR/BS/BT/BU) + v5.6 (BV) HENÜZ
 > DEPLOY EDİLMEDİ.** Lokal: derlendi · AST **0 fonksiyon kaybı (432 → 457)** ·
 > `BYBIT_GUARD`=2 · **12 statik paketin TAMAMI PASS** (`verify_v56_fixes.py`
@@ -278,6 +282,9 @@ Demo log kontrolleri:
 ---
 
 ## 10) GÜNCEL MİMARİ (v2) — order/create KOŞULLU EMİR + CID  ⭐
+
+> [!WARNING]
+> **Tarihsel Bağlam ve Güncel Sınır (v6.0 Fix CD):** Bu bölümde anlatılan "CID yanmışsa generation artırıp yeniden create et" mantığı, v6.0'da sınırlandırılmıştır. Borsa emri `filled` olduğunda veya borsa pozisyonu sıfır olduğunda generation artırılmaz; ayrıntılar için bkz. **§35.2**.
 
 ### 10.1 Neden değişti (log kanıtı)
 İlk tur `tpslMode="Partial"` trading-stop kullanıyordu. Canlı demo logunda
@@ -502,6 +509,9 @@ aynı parça için tekrarlayan `🩹 eksik koruma tamamlandı`.
 ---
 
 ## 12) v3.1 — CANLI DEPLOY SONRASI BULGULAR (2026-07-28 deploy @18:40)  ⭐⭐⭐
+
+> [!WARNING]
+> **Tarihsel Bağlam ve Güncel Sınır (v6.0 Fix CD):** v3.1 recovery döngülerinde karşılaşılan CID yanmalarında körlemesine generation artırma, v6.0 Fix CD ile borsa pozisyonu sıfırken veya emir dolmuşken engellenmiştir. Bkz. **§35.2**.
 
 ### 12.1 Kalan API varsayımları KAPANDI (canlı DOGEUSDT SHORT üzerinde test)
 | Test | Sonuç |
@@ -1324,6 +1334,9 @@ piyasaya göre iyimser demektir → `BYBIT_TP_LIMIT_SLIP_PCT`/`GRACE_S` ayarlanm
 
 ## 19) v4.1 — 🛡️ TOPLAM SL KAPSAMA DENETİMİ (10:40 yarışının fixi)
 
+> [!WARNING]
+> **Tarihsel Bağlam ve Güncel Sınır (v6.0 Fix CD / CF):** Bu bölümdeki `_has_leg` fonksiyonunda yer alan "CID yoksa ±%5 miktar toleransı" kuralı, v6.0 Fix CF ile kaldırılmıştır. Güncel davranışta `parent_id` tam eşleşmesi ve quantize edilmiş miktar tam eşitliği zorunludur. Bkz. **§35.4**.
+
 ### 19.1 Olayın tam anatomisi (canlı, 2026-07-31 10:40:20 ETH-USDT SHORT)
 ```
 10:40:20  FAZ 2 AKTIVASYON #907992450676  -> reduceOnly close 1.29   ┐ AYNI TICK
@@ -1600,6 +1613,9 @@ başıboş `H-T-*` limit legleri.
 ---
 
 ## 21) v4.3 — ORPHAN SL (TP-fill atfı) + TP ESCALATE boşluğu + SİNYAL VALİDASYONU + MQTT SESSİZLİĞİ
+
+> [!WARNING]
+> **Tarihsel Bağlam ve Güncel Sınır (v6.0 Fix CD):** Orphan SL atfı ve kaçan fill sonrası stop üretimi sorunları, v6.0 Fix CD terminal stop ve idempotent dolum defterleri ile çözülmüştür. Bkz. **§35.2**.
 
 ### 21.1 🕵️ 17:10 sinyali neden hiç log üretmedi — BOT SUÇLU DEĞİL
 Zincir baştan sona izlendi (2026-08-01, sinyal 17:10 TR = **14:10 UTC**):
@@ -3560,7 +3576,7 @@ RR2 modunda fiyat 2R seviyesini aştıktan sonra fitil/wick hareketlerinde kâr�
 - **Giriş Emri:** Girişte limit TP konulmaz (`tp_suppressed=True`, `RR2_PLACE_ENTRY_TP=0`).
 - **Aşama 1 (1R Tetikleyici — `HYBRID_WAIT` → `HYBRID_TRANSITIONING`):**
   - Fiyat fee-aware 1R seviyesine ulaştığında %50 kısmi kapanış için reduce-only limit/market TP1 emri gönderilir (`HYBRID_CLOSE_PENDING`).
-  - SL derhal giriş seviyesine (BE +%0.5 koruma marjı ile) taşınır.
+  - SL derhal giriş seviyesine taşınır: gerçek stop hedefi `entry` fiyatıdır; kodda ve loglarda tarihsel olarak `[HYBRID +0.5% BE]` etiketi geçse de ek bir %0.5 stop tamponu yoktur (`sl_price=entry` gönderilir). Fee-aware R hesabı ise R1, R2 ve TP geometrisinde tahmini round-trip komisyonu R mesafesine dahil eder; ancak stop emrinin kendisi `entry` seviyesine konduğundan, stop tetiklendiğinde gerçekleşen kayma (slippage) ve komisyonlar nedeniyle ücretler dahil net sıfır zarar (breakeven) garantisi vermez.
 - **Aşama 2 (1R–2R Arası Bekleme — `HYBRID_HOLD_ENTRY`):**
   - TP1 gerçekleştikten sonra kalan parça `HYBRID_HOLD_ENTRY` aşamasına geçer.
   - 1R ile 2R arasında trailing çalıştırılmaz; doğrulanmış entry stop (BE) korunur. Bu sayede 1R-2R arasındaki salınımlarda erken stop olma riski engellenir.
@@ -3595,38 +3611,44 @@ RR2 modunda fiyat 2R seviyesini aştıktan sonra fitil/wick hareketlerinde kâr�
      Mevcut stoptan daha kötü veya eşit operasyonel hedef borsaya gönderilmez.
   4. Quantize fonksiyonu hata verirse ham float ile devam edilmez; mevcut stop ve state korunup 3s throttle ile retry edilir.
 
-### 35.2 Fix CD — Terminal Filled Stop Idempotent Muhasebesi ve Sıfır Tolerans Mutabakatı
+### 35.2 Fix CD — Terminal Filled Stop, Residual Emir Ayrımı ve Idempotent Muhasebe
 - **Kök Neden:** WS bağlantı kopukluğunda veya kaçan WS fill mesajlarında, borsa koşullu emri Filled olduğunda bot bunu yalnızca CID yanması sanıp generation artırıyor ve borsa pozisyonu sıfırlanmışken dahi yeni yetim stoplar (BB1/BB2) üretiyordu.
-- **Düzeltme:**
-  1. `live_status == "filled"` açıkça yakalanır.
-  2. `burned_parent` kimliği tracked parça (`order_id`) ile eşleştirilir.
-  3. Gerçek dolum miktarı `cumExecQty` veya `/v5/execution/list` (yalnızca `execType == Trade`) üzerinden kesinleştirilir.
-  4. **Tekilleştirme Defterleri (Idempotent Accounting):**
-     - `applied_cumulative_fill`: Emir bazında kümülatif dolum defteri.
-     - `applied_exec_ids`: WS gerçekleşme kimlikleri (`execId`).
-     - `ws_fills_by_order`: WS üzerinden gelen dolum toplamı.
-     - Yeni dolum farkı: $\Delta = \max(0, \text{cum\_exec} - \text{prev\_applied})$. WS ve REST aynı gerçekleşmeyi asla ikinci kez düşmez.
-  5. **Kısmi Dolum (Residual $> 0$):** Kalan miktar için aktif stopun varlığı 6 katı kriterle sorgulanır:
-     - (1) SL türü kontrolü (`kind == "SL"`).
-     - (2) Parent kimliği tam eşleşmesi (`parent_id == burned_parent` — sibling stopu ASLA koruma sayılmaz).
-     - (3) Quantize edilmiş miktar tam eşitliği (`q_c_qty == q_new_rem`).
-     - (4) Fiyat geçerliliği ve parent SL karşılama kontrolü.
-     - (5) Aktif durum kontrolü (açık izin listesi: `untriggered`, `new`, `active`; unknown/boş reddedilir).
-     - (6) Doğru pozisyon bacağı (`positionIdx` ve `side`).
-  6. **Tam Dolum (Residual $== 0$):**
-     - Taze borsa pozisyon snapshot'ı (`ensure_fresh=True`) alınır.
-     - Gerçek borsa pozisyonu ile kalan sibling toplamı quantize hassasiyetinde sıfır toleransla (`q_real == q_expected`) uyuşmalıdır (%5 tolerans kaldırılmıştır).
-     - Mutabakat tam ise `_archive_trigger_close` çağrılır, `_cleanup_position_tracking` ile parent temizlenir ve state kaydedilir.
-  7. **Sıfır Borsa Pozisyonunda Durma:** Gerçek borsa pozisyonu $\le 0$ ise CID yanmış olsa bile asla yeni generation yetim stop üretilmez (`zero_position_no_stop`).
+- **Emir Durumu Ayrımı (CID Generation Sınırları):**
+  1. **`live_status == "filled"` (Terminal veya Kısmi Dolum):** Borsa koşullu emri gerçekleştiğinde generation artırılmaz. `burned_parent` kimliği tracked parça (`order_id`) ile eşleştirilir; gerçek dolum miktarı `cumExecQty` veya `/v5/execution/list` (`execType == Trade`) üzerinden kesinleştirilerek idempotent dolum defterleri çalıştırılır.
+  2. **İptal / Devre Dışı Durumlar (`live_status in ("cancelled", "deactivated", ...)`):**
+     - Eğer borsa pozisyonu sıfır ise (`real_pos_amt <= 0`), generation artırılmaz (`zero_position_no_stop`) ve yetim stop üretimi engellenir.
+     - Eğer borsa pozisyonu > 0 ise, meşru residual koruma ihtiyacı için CID generation rotasyonu (`_bybit_bump_cid_generation`) çalışmaya devam eder ve borsa üzerinde yeni stop emri oluşturulur. Yani CID generation her koşulda kaldırılmış değildir; borsa pozisyonu varken iptal/deaktif emirler için korunur.
+  3. **Belirsiz Durumlar (Ambiguous States):**
+     - `cumExecQty` veya trade execution doğrulanmazsa (`ambiguous_fill_preserved`), fazla dolum şüphesinde (`overfill_ambiguous_preserved`), taze borsa snapshot'ı alınamazsa (`missing_snapshot_preserved`) veya borsa miktarı ile kalan sibling toplamı uyuşmazsa (`aggregate_mismatch_preserved`): parent tracking'den silinmez, sessiz başarı verilmez ve belirsiz durum korunarak salt-okunur reconcile beklenir.
+- **Tekilleştirme Defterleri (Idempotent Accounting):**
+  - `applied_cumulative_fill`: Emir bazında kümülatif dolum defteri.
+  - `applied_exec_ids`: WS gerçekleşme kimlikleri (`execId`).
+  - `ws_fills_by_order`: WS üzerinden gelen dolum toplamı.
+  - Yeni dolum farkı: $\Delta = \max(0, \text{cum\_exec} - \text{prev\_applied})$. WS ve REST aynı gerçekleşmeyi asla ikinci kez düşmez.
+- **Kısmi Dolum (Residual $> 0$):** Kalan miktar için aktif stopun varlığı 6 katı kriterle sorgulanır:
+  - (1) SL türü kontrolü (`kind == "SL"`).
+  - (2) Parent kimliği tam eşleşmesi (`parent_id == burned_parent` — sibling stopu ASLA koruma sayılmaz).
+  - (3) Quantize edilmiş miktar tam eşitliği (`q_c_qty == q_new_rem`).
+  - (4) Fiyat geçerliliği ve parent SL karşılama kontrolü.
+  - (5) Aktif durum kontrolü (açık izin listesi: `untriggered`, `new`, `active`; unknown/boş reddedilir).
+  - (6) Doğru pozisyon bacağı (`positionIdx` ve `side`).
+- **Tam Dolum (Residual $== 0$):**
+  - Taze borsa pozisyon snapshot'ı (`ensure_fresh=True`) alınır.
+  - Gerçek borsa pozisyonu ile kalan sibling toplamı quantize hassasiyetinde sıfır toleransla (`q_real == q_expected`) uyuşmalıdır.
+  - Mutabakat tam ise `_archive_trigger_close` çağrılır, `_cleanup_position_tracking` ile parent temizlenir ve state kaydedilir.
+- **Save-Failure Davranışı:** State kaydetme başarısızlığında (`_save_state() == False`), "sessiz başarı verilmez; kalıcı kayıt doğrulanmış sayılmaz" (`out["status"] = "state_save_failed"` döner). Ancak bu durum, çağrı öncesinde bellekte yapılmış olabilecek ara state/defter güncellemelerinin veya liste temizliklerinin hiç yapılmadığına dair mutlak bir garanti vermez; salt kalıcı disk mutabakatının sağlanamadığını ifade eder.
 
 ### 35.3 Fix CE — Mevcut Daha İyi Stopu Koruma (`_place_bybit_conditional_order`)
 - Canlı borsadaki stop trigger fiyatı istenen hedeften daha iyiyse:
   - Miktar tam uyuşuyorsa: amend gönderilmez, daha iyi stop korunur (`preserved_better_sl`).
   - Miktar uyuşmuyorsa: fiyat gevşetilmeden mevcut daha iyi fiyat muhafaza edilerek yalnız miktar düzeltilir (`amended_qty_only`).
 
-### 35.4 Fix CF — State Persistence ve Sibling İzolasyonu
-- `applied_cumulative_fill`, `applied_exec_ids`, `ws_fills_by_order` hem `_save_state` hem de `_load_state` içine eklenerek yeniden başlatmalarda korunur.
-- `_has_leg` fonksiyonunda yaklaşık eşleşmeler ve eksik CID toleransları kaldırıldı; `parent_id` tam eşitliği ve quantize miktar zorunlu hale getirildi.
+### 35.4 Fix CF — State Persistence, Sibling İzolasyonu ve %5 Toleransının Kapsamı
+- **State Defterlerinin Kalıcılığı:** `applied_cumulative_fill`, `applied_exec_ids`, `ws_fills_by_order` hem `_save_state` hem de `_load_state` içine eklenerek yeniden başlatmalarda korunur.
+- **%5 Tolerans Değişikliğinin Gerçek Fonksiyon Kapsamı:** Yüzde 5 (%5) toleransının kaldırılması tüm kod tabanında genel bir değişiklik değildir; yalnız iki kritik fonksiyonun ilgili kararlarıyla sınırlıdır:
+  1. `_has_leg` fonksiyonunda (L9580+): Eksik CID durumunda miktar üzerinden `±%5` yaklaşık eşleşme kaldırılmış, `parent_id` tam eşleşmesi ve quantize edilmiş miktar tam eşitliği (`q_c_qty == q_piece`) zorunlu kılınmıştır. Sibling stopu asla koruma sayılamaz.
+  2. `_place_bybit_conditional_order` terminal tam dolum kontrolünde (L2835+ / L3340+): Gerçek borsa pozisyonu ile kalan sibling toplamının mutabakatında %5 tolerans kaldırılmış, quantize hassasiyetinde sıfır tolerans (`q_real == q_expected`) şart koşulmuştur.
+  - Kod tabanındaki diğer ilgisiz alanlar (ör. ilk sizing marj tavanları veya arşiv oran kontrolleri) bu değişikliğin kapsamı dışındadır.
 
 ### 35.5 Doğrulama ve Deploy Paketi
 - **Lokal Test Paketi:** `tests/run_all_candidate_tests.py` -> **37/37 PASS** (23 strict terminal + 13 quantize + 1 real AST E2E).
@@ -3635,3 +3657,10 @@ RR2 modunda fiyat 2R seviyesini aştıktan sonra fitil/wick hareketlerinde kâr�
 - **Kalıcı Host Dosyası:** `/home/ubuntu/deploy/bots/scripts/tv_signal_strategy.py`
 - **Doğrulanmış SHA256:** `4f95aa04183052f4333b32960067e3591c0f48b0a6dbeb512ac442a93687af41`
 - **Konteyner SHA256:** `4f95aa04183052f4333b32960067e3591c0f48b0a6dbeb512ac442a93687af41` (Birebir eşleşti).
+
+
+### 35.6 Eski-State Çift-Düşüm Migration Uyarısı (Flat Deploy vs. Kendi State'inden Restart)
+- **Migration Sınırı:** `4F95AA04` sürümünde, eski `51F6CDD4` state'inden devralınan açık pozisyonlarda daha önce uygulanmış kısmi dolumların (`remaining_amount < amount`) REST execution geçmişiyle tekrar düşülmesini engelleyen 5 satırlık state-migration guard'ı bilinçli olarak eklenmemiştir.
+- **Flat Deploy (Kullanılan ve Doğrulanan Yöntem):** Borsa pozisyonları kullanıcı tarafından manuel kapatılmış, state dosyası sıfırlanmış ve bot 0 pozisyonla temiz başlatılmıştır. Bu sayede eski state'ten kaynaklanabilecek çift-düşüm (double-deduction) riski flat deploy'da oluşmaz.
+- **4F95AA04 Kendi State'inden Restart:** Yeni sürümün kendi ürettiği state şemasında `applied_cumulative_fill`, `applied_exec_ids` ve `ws_fills_by_order` defterleri persist edildiği için, botun kendi state'inden yeniden başlatılması (restart) güvenli ve idempotenttir.
+- ⚠️ **Kritik Kural:** Eski `51F6CDD4` state'i açık pozisyon içerirken doğrudan `4F95AA04` sürümüne devredilmemelidir.
