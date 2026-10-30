@@ -12,8 +12,8 @@ Bu kılavuz, Hummingbot TradingView sinyal stratejisinin Bybit Demo ortamından 
 ---
 
 
-> **Canlı Doğrulama ve Güvenlik Notu (2026-10-30):**
-> Bu kılavuzdaki Live geçiş adımları uygulanmadan önce kullanılan `4F95AA04` strateji sürümü, Bybit vadeli altyapısında 39 saat boyunca 27 gerçek pozisyonda adli doğrulamadan geçmiştir. Borsa emir senkronizasyonu (%100 koşullu stop koruması), tick quantize mutabakatı ve sıfır borsa orphan stop garantisi canlı verilerle teyit edilmiştir. Live ortama geçildiğinde aynı borsa entegrasyonu birebir geçerlidir.
+> **Bybit Demo Gözlem ve Güvenlik Notu (2026-10-30):**
+> Bu kılavuzdaki Live geçiş adımları uygulanmadan önce kullanılan `4F95AA04` strateji sürümü, Bybit vadeli Demo altyapısında 39 saat boyunca 27 pozisyonda gözlemlenmiştir. Gözlem aralığında koşullu stop yerleşimi, tick quantize mutabakatı ve yetim stop oluşmaması incelenen veri seti kapsamında doğrulanmıştır. Demo ortamındaki bu bulguların gerçek para (Live) ortamındaki farklı likidite, emir karşılama dinamikleri ve komisyon yapıları altında aynı sonuçları vereceği garanti edilemez; Live geçiş öncesinde kontrollü ve düşük hacimli test aşaması zorunludur.
 
 ## BÖLÜM I: Bybit Demo'dan Live (Gerçek Para) Ortamına Geçiş
 

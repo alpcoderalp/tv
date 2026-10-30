@@ -17,8 +17,8 @@ Bu kılavuz, `tv_signal_strategy.py` üzerinde desteklenen üç temel pozisyon y
 
 ---
 
-> **Canlı Adli Doğrulama Notu (2026-10-30):**
-> hybrid_trailing modeli 4F95AA04 sürümü altında Bybit Demo üzerinde yaklaşık 39 saat boyunca 27 adet gerçek canlı pozisyonda test edilmiştir. 0 quantize retrying döngüsü, 0 orphan stop, 12 adet TP1 icrası (+19.19 USDT) ve 7 adet 3R ratchet koşucusu ile toplamda net +26.78 USDT kârlılıkla başarıyla tamamlanmış ve modelin canlı kararlılığı kanıtlanmıştır.
+> **Bybit Demo Gözlem ve Doğrulama Notu (2026-10-30):**
+> `hybrid_trailing` modeli `4F95AA04` sürümü altında Bybit Demo ortamında yaklaşık 39 saat boyunca 27 adet parent pozisyonda (23 tamamlanan, 4 aktif) incelenmiştir. İnceleme aralığında quantize retry döngüsünün tekrarlamadığı (`HYBRID TRAIL 2R RETRY: 0`), yetim stop oluşmadığı, 11 adet TP1 dolumu gerçekleştiği ve 7 adet 3R ratchet koşucusu ile ham Bybit v5 icra kayıtlarına göre tam kapanan 23 parent'ta net +18.9952 USDT (açık parent TP1 dahil toplam +20.7778 USDT) gerçekleşen borsa PnL'i elde edildiği gözlemlenmiştir. Bu veriler Demo simülasyon ortamına ait olup gerçek para ortamı için kâr garantisi teşkil etmez.
 
 ---
 
