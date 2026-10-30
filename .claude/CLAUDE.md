@@ -3802,4 +3802,4 @@ Aynı işlem çifti (`CHIP-USDT_LONG`) üzerinde eşzamanlı 1R koşulu gören k
     - Pozisyon kapandı; bot `[POSITION_FLAT CLOSE ARCHIVED]` ile net -4.5607 USDT kayıpla pozisyonu arşivledi ve temizledi.
 
 > **Sürüm ve Dağıtım Notu:**
-> Yukarıdaki tüm bulgular Bybit Demo ortamında çalışan `4F95AA04` sürümüne aittir. `#882631596625` vakasında tespit edilen kilitlenme kusuru, bu sürümün bilinen bir kısıtıdır. Bu kusuru gidermek için hazırlanan yerel aday (`0B60DDB3...`) yalnızca yerel AST ortamında test edilmiş olup canlıya deploy edilmemiştir.
+> Yukarıdaki tüm bulgular Bybit Demo ortamında çalışan `4F95AA04` sürümüne aittir. `#882631596625` vakasında tespit edilen kilitlenme kusuru, bu sürümün bilinen bir kısıtıdır. Bu kusuru gidermek için hazırlanan yerel aday (`D080D6BA...`) yalnızca yerel AST ortamında test edilmiş olup canlıya deploy edilmemiştir.
