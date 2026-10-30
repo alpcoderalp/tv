@@ -274,7 +274,7 @@ class TestStrictTerminalFixSuite(unittest.TestCase):
     def test_01_candidate_sha256_verified(self):
         print(f"\n[TEST 1] Candidate SHA256: {CANDIDATE_SHA256}")
         self.assertEqual(len(CANDIDATE_SHA256), 64)
-        self.assertIn(CANDIDATE_SHA256, ["0B60DDB301EF1E761DEB5729E8EB6CDB371CF9528D85BE76F581C2BD0B7524A2"])
+        self.assertIn(CANDIDATE_SHA256, ["D080D6BA896795857E12BBCC9FA1B1BCFAF8DBA1F3DA0B6EDEF3CAD23B5F64E5"])
 
     def test_02_full_fill_fresh_snapshot_verified(self):
         """Full fill (5180), sibling (2130), fresh exchange snapshot (2130). Real stop coverage verified."""

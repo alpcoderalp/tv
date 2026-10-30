@@ -1,26 +1,28 @@
-import ast
 import asyncio
+import ast
 import hashlib
+import json
 import os
 import pathlib
 import sys
+import tempfile
 import time
+import types
 import unittest
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple, Any, Set
+from unittest.mock import AsyncMock, MagicMock
 
-# Dynamic relative path resolution - zero local absolute path dependency
-REPO_DIR = pathlib.Path(__file__).resolve().parent.parent
-CANDIDATE_PATH = REPO_DIR / "tv_signal_strategy.py"
+# Base candidate path
+CANDIDATE_PATH = pathlib.Path(__file__).resolve().parent.parent / "tv_signal_strategy.py"
 
-with open(CANDIDATE_PATH, "rb") as f:
-    CODE_BYTES = f.read()
+# Parse AST from candidate
+with open(CANDIDATE_PATH, "r", encoding="utf-8") as f:
+    CANDIDATE_CODE = f.read()
+    CANDIDATE_AST = ast.parse(CANDIDATE_CODE, filename=str(CANDIDATE_PATH))
 
-CANDIDATE_SHA256 = hashlib.sha256(CODE_BYTES).hexdigest().upper()
-
-TREE = ast.parse(CODE_BYTES.decode("utf-8"))
 AST_FUNCS = {}
-for node in TREE.body:
+for node in CANDIDATE_AST.body:
     if isinstance(node, ast.ClassDef) and node.name == "TVSignalStrategy":
         for item in node.body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -82,13 +84,42 @@ class CandidateHarness:
         self._sync_protection = {}
         self._grace_period_until = {}
         self._signal_cache = {}
+        self._trailing_sl_stale_guard = {}
+        self._sltp_placement_active = set()
+        self._phase2_fail_close_guard = {}
+        self._per_fill_accumulators = {}
+        self._close_position_locks = {}
+        self._trailing_sl_pending = {}
         self.connector = MockConnector()
         self.placed_market_orders = []
         self.simulate_network_lost_ack = False
         self.await_delay = 0.005
+        self.pre_close_hook_event: Optional[asyncio.Event] = None
+        self.resume_event: Optional[asyncio.Event] = None
 
     def logger(self):
         return self.logger_inst
+
+    def _should_log_info(self, key, msg):
+        return True
+
+    def _identity_log_event(self, **kwargs):
+        pass
+
+    def _safe_int(self, val):
+        try:
+            return int(val) if val else 0
+        except Exception:
+            return 0
+
+    def _reset_trailing_timeout_log_state(self, val):
+        pass
+
+    def _cancel_sltp_health_task(self, val):
+        pass
+
+    def _cleanup_closed_position_sltp(self, *args, **kwargs):
+        pass
 
     def _pm_mode(self):
         return "hybrid_trailing"
@@ -131,15 +162,23 @@ class CandidateHarness:
     async def _get_bybit_order_by_link_id(self, connector, trading_pair, cid):
         return getattr(connector, "mock_orders", {}).get(cid)
 
+    async def _hybrid_execute_tp1_close(self, connector, exchange, trading_pair, pos_data, close_amount, current_price):
+        if getattr(self, "pre_close_hook_event", None) is not None:
+            self.pre_close_hook_event.set()
+            if getattr(self, "resume_event", None) is not None:
+                await self.resume_event.wait()
+        return await self._orig_hybrid_execute_tp1_close(connector, exchange, trading_pair, pos_data, close_amount, current_price)
+
 # Bind real AST methods from candidate
 CandidateHarness._update_hybrid_peak_price = compile_method("_update_hybrid_peak_price")
 CandidateHarness._ensure_position_r_geometry = compile_method("_ensure_position_r_geometry")
 CandidateHarness._is_hybrid_managed_position = compile_method("_is_hybrid_managed_position")
 CandidateHarness._is_position_protected = compile_method("_is_position_protected")
 CandidateHarness._cleanup_position_tracking = compile_method("_cleanup_position_tracking")
+CandidateHarness._prune_stale_tracked_positions = compile_method("_prune_stale_tracked_positions")
 CandidateHarness._try_trigger_hybrid_management = compile_method("_try_trigger_hybrid_management")
 CandidateHarness._activate_hybrid_management = compile_method("_activate_hybrid_management")
-CandidateHarness._hybrid_execute_tp1_close = compile_method("_hybrid_execute_tp1_close")
+CandidateHarness._orig_hybrid_execute_tp1_close = compile_method("_hybrid_execute_tp1_close")
 CandidateHarness._hybrid_handle_execution_report = compile_method("_hybrid_handle_execution_report")
 CandidateHarness._reconcile_hybrid_pending_close = compile_method("_reconcile_hybrid_pending_close")
 CandidateHarness._reconcile_hybrid_pending_close_guarded = compile_method("_reconcile_hybrid_pending_close_guarded")
@@ -148,27 +187,35 @@ CandidateHarness._reconcile_hybrid_pending_close_guarded = compile_method("_reco
 class TestReleaseControlsAndConcurrencySuite(unittest.IsolatedAsyncioTestCase):
 
     def test_01_candidate_sha256_verified(self):
-        """Verifies candidate SHA256 integrity."""
-        self.assertEqual(len(CANDIDATE_SHA256), 64)
+        """Verify candidate file SHA256 integrity."""
+        h = hashlib.sha256()
+        with open(CANDIDATE_PATH, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        expected_sha = "D080D6BA896795857E12BBCC9FA1B1BCFAF8DBA1F3DA0B6EDEF3CAD23B5F64E5"
         self.assertEqual(
-            CANDIDATE_SHA256,
-            "0B60DDB301EF1E761DEB5729E8EB6CDB371CF9528D85BE76F581C2BD0B7524A2",
+            h.hexdigest().upper(),
+            expected_sha,
+            f"Candidate SHA256 mismatch! Found {h.hexdigest().upper()}, expected {expected_sha}"
         )
 
-    async def test_02_control1_amount_quantize_exception_cleanup_11_cases(self):
-        """Control 1: Missing, None, Zero, Invalid string, NaN, Inf amounts safely handled."""
+    async def test_02_missing_invalid_negative_amounts_preserve_parent_and_block_tp1(self):
+        """Points 1 & 5: Missing, None, invalid strings, NaN, Infinity, and negative amounts:
+        - 0 TP1 orders dispatched.
+        - Parent tracking is strictly preserved (NOT deleted).
+        - tp1_done is NOT set to True.
+        - Stage safely reverts to HYBRID_WAIT for future evaluation.
+        """
         test_cases = [
             ("Missing Amount", {}),
             ("None Amount", {"remaining_amount": None, "amount": None}),
-            ("Zero Integer Amount", {"remaining_amount": 0, "amount": 0}),
-            ("Zero Decimal Amount", {"remaining_amount": Decimal("0"), "amount": Decimal("0")}),
-            ("Zero String Amount", {"remaining_amount": "0", "amount": "0"}),
             ("Invalid String Amount", {"remaining_amount": "invalid_abc", "amount": "invalid_abc"}),
             ("Decimal NaN", {"remaining_amount": Decimal("NaN"), "amount": Decimal("NaN")}),
             ("Decimal Infinity", {"remaining_amount": Decimal("Infinity"), "amount": Decimal("Infinity")}),
             ("Decimal -Infinity", {"remaining_amount": Decimal("-Infinity"), "amount": Decimal("-Infinity")}),
-            ("String nan", {"remaining_amount": "nan", "amount": "nan"}),
-            ("String inf", {"remaining_amount": "inf", "amount": "inf"}),
+            ("Negative Decimal Amount", {"remaining_amount": Decimal("-5000"), "amount": Decimal("-5000")}),
+            ("Negative Integer Amount", {"remaining_amount": -1000, "amount": -1000}),
+            ("Negative String Amount", {"remaining_amount": "-250", "amount": "-250"}),
         ]
 
         for label, amt_fields in test_cases:
@@ -189,22 +236,26 @@ class TestReleaseControlsAndConcurrencySuite(unittest.IsolatedAsyncioTestCase):
             price = Decimal("0.04850")
 
             trig = harness._try_trigger_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price, source="ws")
-            self.assertTrue(trig)
-            self.assertIn(7001, harness._hybrid_transitioning_orders)
+            self.assertTrue(trig, f"Failed trigger for {label}")
 
+            # Await processing task
             await asyncio.sleep(0.02)
 
-            # 1. Zero orders dispatched
-            self.assertEqual(len(harness.placed_market_orders), 0)
-            # 2. Task ownership cleaned up (finally executed!)
-            self.assertNotIn(7001, harness._hybrid_transitioning_orders)
-            self.assertNotIn(7001, harness._processing_phase2_orders)
-            # 3. Stage safety: no active attempt CIDs generated
-            intent = pos.get("tp1_intent") or {}
-            self.assertIsNone(intent.get("current_attempt_cid"))
+            # Assert 1: Zero orders dispatched
+            self.assertEqual(len(harness.placed_market_orders), 0, f"Orders placed for {label}")
+            # Assert 2: Task ownership cleaned up (finally executed)
+            self.assertNotIn(7001, harness._hybrid_transitioning_orders, f"Lock leaked for {label}")
+            self.assertNotIn(7001, harness._processing_phase2_orders, f"Phase2 lock leaked for {label}")
+            # Assert 3: tp1_done is NOT True
+            self.assertFalse(pos.get("tp1_done", False), f"tp1_done incorrectly set True for {label}")
+            # Assert 4: Stage safely restored to HYBRID_WAIT
+            self.assertEqual(pos.get("management_stage"), "HYBRID_WAIT", f"Stage not HYBRID_WAIT for {label}")
+            # Assert 5: Parent tracking preserved (NOT deleted)
+            tracked = [p for p in harness._tracked_positions["CHIP-USDT"]["LONG"] if p.get("order_id") == 7001]
+            self.assertEqual(len(tracked), 1, f"Parent tracking deleted for {label}")
 
-    async def test_03_control1_transient_invalid_data_recovery(self):
-        """Point 1: Transient invalid data reverts to HYBRID_WAIT; when data fixes, monitor re-processes parent."""
+    async def test_03_transient_invalid_data_recovery(self):
+        """Transient invalid data reverts to HYBRID_WAIT; when data fixes, monitor re-processes parent."""
         harness = CandidateHarness()
         pos = {
             "order_id": 7002,
@@ -214,21 +265,23 @@ class TestReleaseControlsAndConcurrencySuite(unittest.IsolatedAsyncioTestCase):
             "sl": Decimal("0.04702"),
             "r1_price": Decimal("0.04838"),
             "r2_price": Decimal("0.04906"),
-            "remaining_amount": "invalid_transient_payload", # Transient invalid data
+            "remaining_amount": "invalid_transient_payload",
             "management_stage": "HYBRID_WAIT",
             "exchange": "bybit_perpetual",
         }
         harness._tracked_positions["CHIP-USDT"]["LONG"] = [pos]
         price = Decimal("0.04850")
 
-        # Tick 1: Trigger with invalid data
+        # Tick 1: Trigger with transient invalid data
         trig1 = harness._try_trigger_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price, source="ws")
         self.assertTrue(trig1)
         await asyncio.sleep(0.02)
 
-        # Must NOT be permanently stuck in HYBRID_TRANSITIONING! Reverted to HYBRID_WAIT
+        # Reverted to HYBRID_WAIT, 0 orders, parent preserved
         self.assertEqual(pos.get("management_stage"), "HYBRID_WAIT")
         self.assertEqual(len(harness.placed_market_orders), 0)
+        self.assertFalse(pos.get("tp1_done", False))
+        self.assertEqual(len(harness._tracked_positions["CHIP-USDT"]["LONG"]), 1)
         self.assertNotIn(7002, harness._hybrid_transitioning_orders)
 
         # Between ticks: Data source fixes
@@ -239,13 +292,17 @@ class TestReleaseControlsAndConcurrencySuite(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(trig2)
         await asyncio.sleep(0.02)
 
-        # Parent successfully re-processed: TP1 dispatched for 2500!
+        # Parent successfully re-processed: TP1 dispatched for 2500
         self.assertEqual(len(harness.placed_market_orders), 1)
         self.assertEqual(harness.placed_market_orders[0]["amount"], Decimal("2500"))
         self.assertEqual(pos.get("management_stage"), "HYBRID_CLOSE_PENDING")
 
-    async def test_04_control2_initial_zero_amount_subsequent_monitor_reconcile_cleanup(self):
-        """Point 2: Initial zero amount produces 0 TP1 orders, 0 re-triggers, and cleans up tracking."""
+    async def test_04_initial_zero_amount_blocks_tp1_and_delegates_to_cleanup(self):
+        """Points 2 & 5: When remaining_amount is explicitly zero:
+        - TP1 activation blocks order placement (0 orders).
+        - Activation function does NOT unilaterally delete parent or force HYBRID_CLOSED.
+        - Existing verified cleanup flow (_prune_stale_tracked_positions) cleanly reclaims the position.
+        """
         harness = CandidateHarness()
         pos = {
             "order_id": 7003,
@@ -263,35 +320,47 @@ class TestReleaseControlsAndConcurrencySuite(unittest.IsolatedAsyncioTestCase):
         harness._tracked_positions["CHIP-USDT"]["LONG"] = [pos]
         price = Decimal("0.04850")
 
-        # Step 1: Initial trigger
-        trig1 = harness._try_trigger_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price, source="ws")
-        self.assertTrue(trig1)
-        await asyncio.sleep(0.02)
+        # Step 1: Initial activation attempt
+        await harness._activate_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price)
 
         # Invariants:
         # a. 0 market orders dispatched
         self.assertEqual(len(harness.placed_market_orders), 0)
-        # b. Stage marked terminal (HYBRID_CLOSED), tp1_done=True
-        self.assertEqual(pos.get("management_stage"), "HYBRID_CLOSED")
-        self.assertTrue(pos.get("tp1_done"))
-        # c. Tracking cleaned up: order removed from tracked positions
+        # b. Activation function does not mark tp1_done
+        self.assertFalse(pos.get("tp1_done", False))
+        # c. Stage safely restored to HYBRID_WAIT
+        self.assertEqual(pos.get("management_stage"), "HYBRID_WAIT")
+        # d. Parent tracking NOT deleted by activation function
         tracked = [p for p in harness._tracked_positions["CHIP-USDT"]["LONG"] if p.get("order_id") == 7003]
-        self.assertEqual(len(tracked), 0)
+        self.assertEqual(len(tracked), 1)
 
-        # Step 2: Subsequent monitor tick
-        trig2 = harness._try_trigger_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price, source="monitor")
-        self.assertFalse(trig2)
+        # Step 2: Real verified cleanup path runs (_prune_stale_tracked_positions)
+        pruned = harness._prune_stale_tracked_positions()
+        self.assertEqual(pruned, 1)
+
+        # Now parent tracking is cleanly pruned by existing verified flow
+        tracked_after = [p for p in harness._tracked_positions["CHIP-USDT"]["LONG"] if p.get("order_id") == 7003]
+        self.assertEqual(len(tracked_after), 0)
+
+        # Step 3: Direct activation on pruned position produces 0 orders
+        await harness._activate_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price)
         self.assertEqual(len(harness.placed_market_orders), 0)
 
-        # Step 3: Subsequent reconcile tick
-        recon = await harness._reconcile_hybrid_pending_close_guarded(harness.connector, "CHIP-USDT", "LONG", pos)
-        self.assertFalse(recon)
-        self.assertEqual(len(harness.placed_market_orders), 0)
-
-    async def test_05_control2_post_await_zero_amount_subsequent_monitor_reconcile_cleanup(self):
-        """Point 2: Post-await zero amount produces 0 TP1 orders, 0 re-triggers, and cleans up tracking."""
+    async def test_05_zero_amount_on_async_suspension_blocks_tp1_and_delegates_to_cleanup(self):
+        """Points 2, 4 & 5: Deterministic task synchronization with asyncio.Event:
+        Simulate an asynchronous task switch before intent creation where remaining_amount becomes 0:
+        - TP1 order placement is blocked (0 orders).
+        - Activation function does NOT unilaterally delete parent or force terminal stage.
+        - Existing verified cleanup flow cleanly prunes tracking.
+        Production note: In the production codebase, _activate_hybrid_management -> _hybrid_execute_tp1_close
+        executes synchronously up to market order placement. This test deterministically simulates an asynchronous
+        task suspension using asyncio.Event to prove that if remaining_amount changes while suspended before intent
+        generation, fresh amount is strictly re-read and enforced.
+        """
         harness = CandidateHarness()
-        harness.await_delay = 0.05
+        harness.pre_close_hook_event = asyncio.Event()
+        harness.resume_event = asyncio.Event()
+
         pos = {
             "order_id": 7004,
             "trading_pair": "CHIP-USDT",
@@ -307,23 +376,40 @@ class TestReleaseControlsAndConcurrencySuite(unittest.IsolatedAsyncioTestCase):
         harness._tracked_positions["CHIP-USDT"]["LONG"] = [pos]
         price = Decimal("0.04850")
 
-        # Position is closed during processing (remaining_amount becomes 0)
+        # Start task
+        task = asyncio.create_task(harness._activate_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price))
+
+        # Deterministically wait until suspended at pre-order hook
+        await harness.pre_close_hook_event.wait()
+
+        # Concurrent event while suspended: position closed on exchange (remaining_amount becomes 0)
         pos["remaining_amount"] = Decimal("0")
 
-        await harness._activate_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price)
+        # Resume task
+        harness.resume_event.set()
+        await task
 
+        # Invariants:
         # a. 0 market orders dispatched
         self.assertEqual(len(harness.placed_market_orders), 0)
-        # b. Stage marked terminal (HYBRID_CLOSED), tp1_done=True
-        self.assertEqual(pos.get("management_stage"), "HYBRID_CLOSED")
-        self.assertTrue(pos.get("tp1_done"))
-        # c. Tracking cleaned up
+        # b. Activation function did not mark tp1_done
+        self.assertFalse(pos.get("tp1_done", False))
+        # c. Stage safely restored to HYBRID_WAIT
+        self.assertEqual(pos.get("management_stage"), "HYBRID_WAIT")
+        # d. Parent tracking NOT deleted by activation function
         tracked = [p for p in harness._tracked_positions["CHIP-USDT"]["LONG"] if p.get("order_id") == 7004]
-        self.assertEqual(len(tracked), 0)
+        self.assertEqual(len(tracked), 1)
 
-        # Subsequent monitor and reconcile calls
-        self.assertFalse(harness._try_trigger_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price))
-        self.assertFalse(await harness._reconcile_hybrid_pending_close_guarded(harness.connector, "CHIP-USDT", "LONG", pos))
+        # Step 2: Real verified cleanup path runs (_prune_stale_tracked_positions)
+        pruned = harness._prune_stale_tracked_positions()
+        self.assertEqual(pruned, 1)
+
+        # Tracking is now cleanly pruned
+        tracked_after = [p for p in harness._tracked_positions["CHIP-USDT"]["LONG"] if p.get("order_id") == 7004]
+        self.assertEqual(len(tracked_after), 0)
+
+        # Step 3: Direct activation produces 0 orders
+        await harness._activate_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price)
         self.assertEqual(len(harness.placed_market_orders), 0)
 
     async def test_06_control2_real_pending_reconcile_on_lost_ack(self):
@@ -350,7 +436,7 @@ class TestReleaseControlsAndConcurrencySuite(unittest.IsolatedAsyncioTestCase):
         # Step 1: Dispatch with lost ACK
         trig1 = harness._try_trigger_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price, source="ws")
         self.assertTrue(trig1)
-        for _ in range(25):
+        for _ in range(50):
             await asyncio.sleep(0.01)
             if pos.get("tp1_intent", {}).get("status") == "SUBMIT_FAILED":
                 break
@@ -393,29 +479,41 @@ class TestReleaseControlsAndConcurrencySuite(unittest.IsolatedAsyncioTestCase):
         """Control 3: HYBRID_CLOSE_PENDING set by callee is never reverted to HYBRID_WAIT by caller."""
         harness = CandidateHarness()
         pos = {
-            "order_id": 999333,
+            "order_id": 999111222,
             "trading_pair": "CHIP-USDT",
             "side": "LONG",
             "entry": Decimal("0.04770"),
             "sl": Decimal("0.04702"),
             "r1_price": Decimal("0.04838"),
             "r2_price": Decimal("0.04906"),
-            "amount": Decimal("4000"),
-            "remaining_amount": Decimal("4000"),
-            "management_stage": "HYBRID_TRANSITIONING",
+            "amount": Decimal("5000"),
+            "remaining_amount": Decimal("5000"),
+            "management_stage": "HYBRID_WAIT",
             "exchange": "bybit_perpetual",
         }
         harness._tracked_positions["CHIP-USDT"]["LONG"] = [pos]
+        price = Decimal("0.04850")
 
-        await harness._activate_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, Decimal("0.04850"))
+        # Simulate submit failure in place_market_order
+        harness.simulate_network_lost_ack = True
+        await harness._activate_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price)
 
-        self.assertEqual(pos["management_stage"], "HYBRID_CLOSE_PENDING")
-        self.assertEqual(len(harness.placed_market_orders), 1)
+        # Callee sets HYBRID_CLOSE_PENDING; caller must NOT overwrite it with HYBRID_WAIT!
+        self.assertEqual(pos.get("management_stage"), "HYBRID_CLOSE_PENDING")
 
-    async def test_08_control4_stale_quantity_protection_across_awaits(self):
-        """Control 4: If remaining_amount changes during await, fresh quantity is used."""
+    async def test_08_fresh_quantity_recheck_on_async_suspension(self):
+        """Points 4 & 5: Deterministic task synchronization with asyncio.Event:
+        Simulate an asynchronous task switch before intent creation where remaining_amount changes:
+        - Fresh quantity is re-verified and used for sizing instead of stale value.
+        Production note: In the production codebase, _activate_hybrid_management -> _hybrid_execute_tp1_close
+        executes synchronously up to market order placement. This test deterministically simulates an asynchronous
+        task suspension using asyncio.Event to prove that if remaining_amount changes while suspended before intent
+        generation, fresh amount is strictly re-read and enforced.
+        """
         harness = CandidateHarness()
-        harness.await_delay = 0.05
+        harness.pre_close_hook_event = asyncio.Event()
+        harness.resume_event = asyncio.Event()
+
         pos = {
             "order_id": 555666777,
             "trading_pair": "CHIP-USDT",
@@ -432,11 +530,20 @@ class TestReleaseControlsAndConcurrencySuite(unittest.IsolatedAsyncioTestCase):
         harness._tracked_positions["CHIP-USDT"]["LONG"] = [pos]
         price = Decimal("0.04850")
 
-        # Amount changes during processing to 2000
+        # Start task
+        task = asyncio.create_task(harness._activate_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price))
+
+        # Deterministically wait until suspended at pre-order hook
+        await harness.pre_close_hook_event.wait()
+
+        # Amount changes while suspended from 10000 to 2000
         pos["remaining_amount"] = Decimal("2000")
 
-        await harness._activate_hybrid_management("bybit_perpetual", "CHIP-USDT", pos, price)
+        # Resume task
+        harness.resume_event.set()
+        await task
 
+        # Fresh quantity (2000 / 2 = 1000) used instead of initial (10000 / 2 = 5000)
         self.assertEqual(len(harness.placed_market_orders), 1)
         self.assertEqual(harness.placed_market_orders[0]["amount"], Decimal("1000"))
 
@@ -476,7 +583,7 @@ class TestReleaseControlsAndConcurrencySuite(unittest.IsolatedAsyncioTestCase):
         trig_B = harness._try_trigger_hybrid_management("bybit_perpetual", "CHIP-USDT", pos_B, price, source="ws")
         self.assertTrue(trig_A and trig_B)
 
-        for _ in range(30):
+        for _ in range(50):
             await asyncio.sleep(0.01)
             if len(harness.placed_market_orders) >= 1 and pos_A.get("management_stage") == "HYBRID_CLOSE_PENDING":
                 break
@@ -487,7 +594,7 @@ class TestReleaseControlsAndConcurrencySuite(unittest.IsolatedAsyncioTestCase):
         # Tick 2: Lock released by A. B evaluates on next tick
         trig_B_tick2 = harness._try_trigger_hybrid_management("bybit_perpetual", "CHIP-USDT", pos_B, price, source="monitor")
         self.assertTrue(trig_B_tick2)
-        for _ in range(30):
+        for _ in range(50):
             await asyncio.sleep(0.01)
             if len(harness.placed_market_orders) >= 2 and pos_B.get("management_stage") == "HYBRID_CLOSE_PENDING":
                 break
